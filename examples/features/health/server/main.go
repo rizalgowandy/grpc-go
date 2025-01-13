@@ -16,7 +16,8 @@
  *
  */
 
-// Binary server is an example server.
+// Binary server demonstrates how to manage and report its health status using
+// the gRPC health library.
 package main
 
 import (
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/grpc"
 	pb "google.golang.org/grpc/examples/features/proto/echo"
 	"google.golang.org/grpc/health"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
@@ -44,7 +46,7 @@ type echoServer struct {
 	pb.UnimplementedEchoServer
 }
 
-func (e *echoServer) UnaryEcho(ctx context.Context, req *pb.EchoRequest) (*pb.EchoResponse, error) {
+func (e *echoServer) UnaryEcho(context.Context, *pb.EchoRequest) (*pb.EchoResponse, error) {
 	return &pb.EchoResponse{
 		Message: fmt.Sprintf("hello from localhost:%d", *port),
 	}, nil
@@ -62,7 +64,7 @@ func main() {
 
 	s := grpc.NewServer()
 	healthcheck := health.NewServer()
-	healthpb.RegisterHealthServer(s, healthcheck)
+	healthgrpc.RegisterHealthServer(s, healthcheck)
 	pb.RegisterEchoServer(s, &echoServer{})
 
 	go func() {

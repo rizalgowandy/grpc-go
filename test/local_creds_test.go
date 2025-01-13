@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -35,12 +36,13 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	testpb "google.golang.org/grpc/test/grpc_testing"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 func testLocalCredsE2ESucceed(network, address string) error {
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			pr, ok := peer.FromContext(ctx)
 			if !ok {
 				return nil, status.Error(codes.DataLoss, "Failed to get peer from ctx")
@@ -73,7 +75,7 @@ func testLocalCredsE2ESucceed(network, address string) error {
 	s := grpc.NewServer(sopts...)
 	defer s.Stop()
 
-	testpb.RegisterTestServiceServer(s, ss)
+	testgrpc.RegisterTestServiceServer(s, ss)
 
 	lis, err := net.Listen(network, address)
 	if err != nil {
@@ -88,11 +90,11 @@ func testLocalCredsE2ESucceed(network, address string) error {
 	switch network {
 	case "unix":
 		cc, err = grpc.Dial(lisAddr, grpc.WithTransportCredentials(local.NewCredentials()), grpc.WithContextDialer(
-			func(ctx context.Context, addr string) (net.Conn, error) {
+			func(_ context.Context, addr string) (net.Conn, error) {
 				return net.Dial("unix", addr)
 			}))
 	case "tcp":
-		cc, err = grpc.Dial(lisAddr, grpc.WithTransportCredentials(local.NewCredentials()))
+		cc, err = grpc.NewClient(lisAddr, grpc.WithTransportCredentials(local.NewCredentials()))
 	default:
 		return fmt.Errorf("unsupported network %q", network)
 	}
@@ -101,8 +103,8 @@ func testLocalCredsE2ESucceed(network, address string) error {
 	}
 	defer cc.Close()
 
-	c := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	c := testgrpc.NewTestServiceClient(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
 	if _, err = c.EmptyCall(ctx, &testpb.Empty{}); err != nil {
@@ -171,7 +173,7 @@ func testLocalCredsE2EFail(dopts []grpc.DialOption) error {
 	s := grpc.NewServer(sopts...)
 	defer s.Stop()
 
-	testpb.RegisterTestServiceServer(s, ss)
+	testgrpc.RegisterTestServiceServer(s, ss)
 
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -180,24 +182,24 @@ func testLocalCredsE2EFail(dopts []grpc.DialOption) error {
 
 	var fakeClientAddr, fakeServerAddr net.Addr
 	fakeClientAddr = &net.IPAddr{
-		IP:   net.ParseIP("10.8.9.10"),
+		IP:   netip.MustParseAddr("10.8.9.10").AsSlice(),
 		Zone: "",
 	}
 	fakeServerAddr = &net.IPAddr{
-		IP:   net.ParseIP("10.8.9.11"),
+		IP:   netip.MustParseAddr("10.8.9.11").AsSlice(),
 		Zone: "",
 	}
 
 	go s.Serve(spoofListener(lis, fakeClientAddr))
 
-	cc, err := grpc.Dial(lis.Addr().String(), append(dopts, grpc.WithDialer(spoofDialer(fakeServerAddr)))...)
+	cc, err := grpc.NewClient(lis.Addr().String(), append(dopts, grpc.WithDialer(spoofDialer(fakeServerAddr)))...)
 	if err != nil {
 		return fmt.Errorf("Failed to dial server: %v, %v", err, lis.Addr().String())
 	}
 	defer cc.Close()
 
-	c := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	c := testgrpc.NewTestServiceClient(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
 	_, err = c.EmptyCall(ctx, &testpb.Empty{})

@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/credentials"
@@ -114,7 +115,9 @@ func (c *credsImpl) ClientHandshake(ctx context.Context, authority string, rawCo
 	if chi.Attributes == nil {
 		return c.fallback.ClientHandshake(ctx, authority, rawConn)
 	}
-	hi := xdsinternal.GetHandshakeInfo(chi.Attributes)
+
+	uPtr := xdsinternal.GetHandshakeInfo(chi.Attributes)
+	hi := (*xdsinternal.HandshakeInfo)(atomic.LoadPointer(uPtr))
 	if hi.UseFallbackCreds() {
 		return c.fallback.ClientHandshake(ctx, authority, rawConn)
 	}
@@ -135,7 +138,7 @@ func (c *credsImpl) ClientHandshake(ctx context.Context, authority string, rawCo
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		// Parse all raw certificates presented by the peer.
 		var certs []*x509.Certificate
 		for _, rc := range rawCerts {
@@ -162,8 +165,10 @@ func (c *credsImpl) ClientHandshake(ctx context.Context, authority string, rawCo
 		}
 		// The SANs sent by the MeshCA are encoded as SPIFFE IDs. We need to
 		// only look at the SANs on the leaf cert.
-		if !hi.MatchingSANExists(certs[0]) {
-			return fmt.Errorf("SANs received in leaf certificate %+v does not match any of the accepted SANs", certs[0])
+		if cert := certs[0]; !hi.MatchingSANExists(cert) {
+			// TODO: Print the complete certificate once the x509 package
+			// supports a String() method on the Certificate type.
+			return fmt.Errorf("xds: received SANs {DNSNames: %v, EmailAddresses: %v, IPAddresses: %v, URIs: %v} do not match any of the accepted SANs", cert.DNSNames, cert.EmailAddresses, cert.IPAddresses, cert.URIs)
 		}
 		return nil
 	}
