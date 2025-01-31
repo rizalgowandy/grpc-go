@@ -22,6 +22,8 @@ import (
 	"container/list"
 	"time"
 
+	"github.com/google/uuid"
+	estats "google.golang.org/grpc/experimental/stats"
 	"google.golang.org/grpc/internal/backoff"
 	internalgrpclog "google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcsync"
@@ -47,7 +49,7 @@ type cacheEntry struct {
 	// headerData is received in the RLS response and is to be sent in the
 	// X-Google-RLS-Data header for matching RPCs.
 	headerData string
-	// expiryTime is the absolute time at which this cache entry entry stops
+	// expiryTime is the absolute time at which this cache entry stops
 	// being valid. When an RLS request succeeds, this is set to the current
 	// time plus the max_age field from the LB policy config.
 	expiryTime time.Time
@@ -91,8 +93,6 @@ type cacheEntry struct {
 	// size stores the size of this cache entry. Used to enforce the cache size
 	// specified in the LB policy configuration.
 	size int64
-	// onEvict is the callback to be invoked when this cache entry is evicted.
-	onEvict func()
 }
 
 // backoffState wraps all backoff related state associated with a cache entry.
@@ -156,20 +156,6 @@ func (l *lru) getLeastRecentlyUsed() cacheKey {
 	return e.Value.(cacheKey)
 }
 
-// iterateAndRun traverses the lru in least-recently-used order and calls the
-// provided function for every element.
-//
-// Callers may delete the cache entry associated with the cacheKey passed into
-// f, but they may not perform any other operation which reorders the elements
-// in the lru.
-func (l *lru) iterateAndRun(f func(cacheKey)) {
-	var next *list.Element
-	for e := l.ll.Front(); e != nil; e = next {
-		next = e.Next()
-		f(e.Value.(cacheKey))
-	}
-}
-
 // dataCache contains a cache of RLS data used by the LB policy to make routing
 // decisions.
 //
@@ -179,22 +165,37 @@ func (l *lru) iterateAndRun(f func(cacheKey)) {
 //
 // It is not safe for concurrent access.
 type dataCache struct {
-	maxSize     int64 // Maximum allowed size.
-	currentSize int64 // Current size.
-	keys        *lru  // Cache keys maintained in lru order.
-	entries     map[cacheKey]*cacheEntry
-	logger      *internalgrpclog.PrefixLogger
-	shutdown    *grpcsync.Event
+	maxSize         int64 // Maximum allowed size.
+	currentSize     int64 // Current size.
+	keys            *lru  // Cache keys maintained in lru order.
+	entries         map[cacheKey]*cacheEntry
+	logger          *internalgrpclog.PrefixLogger
+	shutdown        *grpcsync.Event
+	rlsServerTarget string
+
+	// Read only after initialization.
+	grpcTarget      string
+	uuid            string
+	metricsRecorder estats.MetricsRecorder
 }
 
-func newDataCache(size int64, logger *internalgrpclog.PrefixLogger) *dataCache {
+func newDataCache(size int64, logger *internalgrpclog.PrefixLogger, metricsRecorder estats.MetricsRecorder, grpcTarget string) *dataCache {
 	return &dataCache{
-		maxSize:  size,
-		keys:     newLRU(),
-		entries:  make(map[cacheKey]*cacheEntry),
-		logger:   logger,
-		shutdown: grpcsync.NewEvent(),
+		maxSize:         size,
+		keys:            newLRU(),
+		entries:         make(map[cacheKey]*cacheEntry),
+		logger:          logger,
+		shutdown:        grpcsync.NewEvent(),
+		grpcTarget:      grpcTarget,
+		uuid:            uuid.New().String(),
+		metricsRecorder: metricsRecorder,
 	}
+}
+
+// updateRLSServerTarget updates the RLS Server Target the RLS Balancer is
+// configured with.
+func (dc *dataCache) updateRLSServerTarget(rlsServerTarget string) {
+	dc.rlsServerTarget = rlsServerTarget
 }
 
 // resize changes the maximum allowed size of the data cache.
@@ -239,7 +240,7 @@ func (dc *dataCache) resize(size int64) (backoffCancelled bool) {
 				backoffCancelled = true
 			}
 		}
-		dc.deleteAndcleanup(key, entry)
+		dc.deleteAndCleanup(key, entry)
 	}
 	dc.maxSize = size
 	return backoffCancelled
@@ -252,29 +253,22 @@ func (dc *dataCache) resize(size int64) (backoffCancelled bool) {
 // The return value indicates if any expired entries were evicted.
 //
 // The LB policy invokes this method periodically to purge expired entries.
-func (dc *dataCache) evictExpiredEntries() (evicted bool) {
+func (dc *dataCache) evictExpiredEntries() bool {
 	if dc.shutdown.HasFired() {
 		return false
 	}
 
-	evicted = false
-	dc.keys.iterateAndRun(func(key cacheKey) {
-		entry, ok := dc.entries[key]
-		if !ok {
-			// This should never happen.
-			dc.logger.Errorf("cacheKey %+v not found in the cache while attempting to perform periodic cleanup of expired entries", key)
-			return
-		}
-
+	evicted := false
+	for key, entry := range dc.entries {
 		// Only evict entries for which both the data expiration time and
 		// backoff expiration time fields are in the past.
 		now := time.Now()
 		if entry.expiryTime.After(now) || entry.backoffExpiryTime.After(now) {
-			return
+			continue
 		}
+		dc.deleteAndCleanup(key, entry)
 		evicted = true
-		dc.deleteAndcleanup(key, entry)
-	})
+	}
 	return evicted
 }
 
@@ -285,22 +279,15 @@ func (dc *dataCache) evictExpiredEntries() (evicted bool) {
 // The LB policy invokes this method when the control channel moves from READY
 // to TRANSIENT_FAILURE back to READY. See `monitorConnectivityState` method on
 // the `controlChannel` type for more details.
-func (dc *dataCache) resetBackoffState(newBackoffState *backoffState) (backoffReset bool) {
+func (dc *dataCache) resetBackoffState(newBackoffState *backoffState) bool {
 	if dc.shutdown.HasFired() {
 		return false
 	}
 
-	backoffReset = false
-	dc.keys.iterateAndRun(func(key cacheKey) {
-		entry, ok := dc.entries[key]
-		if !ok {
-			// This should never happen.
-			dc.logger.Errorf("cacheKey %+v not found in the cache while attempting to perform periodic cleanup of expired entries", key)
-			return
-		}
-
+	backoffReset := false
+	for _, entry := range dc.entries {
 		if entry.backoffState == nil {
-			return
+			continue
 		}
 		if entry.backoffState.timer != nil {
 			entry.backoffState.timer.Stop()
@@ -310,7 +297,7 @@ func (dc *dataCache) resetBackoffState(newBackoffState *backoffState) (backoffRe
 		entry.backoffTime = time.Time{}
 		entry.backoffExpiryTime = time.Time{}
 		backoffReset = true
-	})
+	}
 	return backoffReset
 }
 
@@ -340,6 +327,8 @@ func (dc *dataCache) addEntry(key cacheKey, entry *cacheEntry) (backoffCancelled
 	if dc.currentSize > dc.maxSize {
 		backoffCancelled = dc.resize(dc.maxSize)
 	}
+	cacheSizeMetric.Record(dc.metricsRecorder, dc.currentSize, dc.grpcTarget, dc.rlsServerTarget, dc.uuid)
+	cacheEntriesMetric.Record(dc.metricsRecorder, int64(len(dc.entries)), dc.grpcTarget, dc.rlsServerTarget, dc.uuid)
 	return backoffCancelled, true
 }
 
@@ -349,6 +338,7 @@ func (dc *dataCache) updateEntrySize(entry *cacheEntry, newSize int64) {
 	dc.currentSize -= entry.size
 	entry.size = newSize
 	dc.currentSize += entry.size
+	cacheSizeMetric.Record(dc.metricsRecorder, dc.currentSize, dc.grpcTarget, dc.rlsServerTarget, dc.uuid)
 }
 
 func (dc *dataCache) getEntry(key cacheKey) *cacheEntry {
@@ -369,7 +359,7 @@ func (dc *dataCache) removeEntryForTesting(key cacheKey) {
 	if !ok {
 		return
 	}
-	dc.deleteAndcleanup(key, entry)
+	dc.deleteAndCleanup(key, entry)
 }
 
 // deleteAndCleanup performs actions required at the time of deleting an entry
@@ -377,25 +367,17 @@ func (dc *dataCache) removeEntryForTesting(key cacheKey) {
 // - the entry is removed from the map of entries
 // - current size of the data cache is update
 // - the key is removed from the LRU
-// - onEvict is invoked in a separate goroutine
-func (dc *dataCache) deleteAndcleanup(key cacheKey, entry *cacheEntry) {
+func (dc *dataCache) deleteAndCleanup(key cacheKey, entry *cacheEntry) {
 	delete(dc.entries, key)
 	dc.currentSize -= entry.size
 	dc.keys.removeEntry(key)
-	if entry.onEvict != nil {
-		go entry.onEvict()
-	}
+	cacheSizeMetric.Record(dc.metricsRecorder, dc.currentSize, dc.grpcTarget, dc.rlsServerTarget, dc.uuid)
+	cacheEntriesMetric.Record(dc.metricsRecorder, int64(len(dc.entries)), dc.grpcTarget, dc.rlsServerTarget, dc.uuid)
 }
 
 func (dc *dataCache) stop() {
-	dc.keys.iterateAndRun(func(key cacheKey) {
-		entry, ok := dc.entries[key]
-		if !ok {
-			// This should never happen.
-			dc.logger.Errorf("cacheKey %+v not found in the cache while shutting down", key)
-			return
-		}
-		dc.deleteAndcleanup(key, entry)
-	})
+	for key, entry := range dc.entries {
+		dc.deleteAndCleanup(key, entry)
+	}
 	dc.shutdown.Fire()
 }

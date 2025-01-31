@@ -198,6 +198,86 @@ func (s) TestDelete(t *testing.T) {
 	}
 }
 
+func (s) TestFromIncomingContext(t *testing.T) {
+	md := Pairs(
+		"X-My-Header-1", "42",
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	// Verify that we lowercase if callers directly modify md
+	md["X-INCORRECT-UPPERCASE"] = []string{"foo"}
+	ctx = NewIncomingContext(ctx, md)
+
+	result, found := FromIncomingContext(ctx)
+	if !found {
+		t.Fatal("FromIncomingContext must return metadata")
+	}
+	expected := MD{
+		"x-my-header-1":         []string{"42"},
+		"x-incorrect-uppercase": []string{"foo"},
+	}
+	if !reflect.DeepEqual(result, expected) {
+		t.Errorf("FromIncomingContext returned %#v, expected %#v", result, expected)
+	}
+
+	// ensure modifying result does not modify the value in the context
+	result["new_key"] = []string{"foo"}
+	result["x-my-header-1"][0] = "mutated"
+
+	result2, found := FromIncomingContext(ctx)
+	if !found {
+		t.Fatal("FromIncomingContext must return metadata")
+	}
+	if !reflect.DeepEqual(result2, expected) {
+		t.Errorf("FromIncomingContext after modifications returned %#v, expected %#v", result2, expected)
+	}
+}
+
+func (s) TestValueFromIncomingContext(t *testing.T) {
+	md := Pairs(
+		"X-My-Header-1", "42",
+		"X-My-Header-2", "43-1",
+		"X-My-Header-2", "43-2",
+		"x-my-header-3", "44",
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	// Verify that we lowercase if callers directly modify md
+	md["X-INCORRECT-UPPERCASE"] = []string{"foo"}
+	ctx = NewIncomingContext(ctx, md)
+
+	for _, test := range []struct {
+		key  string
+		want []string
+	}{
+		{
+			key:  "x-my-header-1",
+			want: []string{"42"},
+		},
+		{
+			key:  "x-my-header-2",
+			want: []string{"43-1", "43-2"},
+		},
+		{
+			key:  "x-my-header-3",
+			want: []string{"44"},
+		},
+		{
+			key:  "x-unknown",
+			want: nil,
+		},
+		{
+			key:  "x-incorrect-uppercase",
+			want: []string{"foo"},
+		},
+	} {
+		v := ValueFromIncomingContext(ctx, test.key)
+		if !reflect.DeepEqual(v, test.want) {
+			t.Errorf("value of metadata is %v, want %v", v, test.want)
+		}
+	}
+}
+
 func (s) TestAppendToOutgoingContext(t *testing.T) {
 	// Pre-existing metadata
 	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
@@ -297,4 +377,41 @@ func BenchmarkFromOutgoingContext(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		FromOutgoingContext(ctx)
 	}
+}
+
+func BenchmarkFromIncomingContext(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	md := Pairs("X-My-Header-1", "42")
+	ctx = NewIncomingContext(ctx, md)
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		FromIncomingContext(ctx)
+	}
+}
+
+func BenchmarkValueFromIncomingContext(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	md := Pairs("X-My-Header-1", "42")
+	ctx = NewIncomingContext(ctx, md)
+
+	b.Run("key-found", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			result := ValueFromIncomingContext(ctx, "x-my-header-1")
+			if len(result) != 1 {
+				b.Fatal("ensures not optimized away")
+			}
+		}
+	})
+
+	b.Run("key-not-found", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			result := ValueFromIncomingContext(ctx, "key-not-found")
+			if len(result) != 0 {
+				b.Fatal("ensures not optimized away")
+			}
+		}
+	})
 }

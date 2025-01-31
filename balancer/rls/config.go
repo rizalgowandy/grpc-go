@@ -25,8 +25,6 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
-	durationpb "github.com/golang/protobuf/ptypes/duration"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/rls/internal/keys"
 	"google.golang.org/grpc/internal"
@@ -35,6 +33,7 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
@@ -113,35 +112,41 @@ type lbConfigJSON struct {
 // ParseConfig parses the JSON load balancer config provided into an
 // internal form or returns an error if the config is invalid.
 //
-// When parsing a config update, the following validations are performed:
-// - routeLookupConfig:
-//   - grpc_keybuilders field:
-//     - must have at least one entry
-//     - must not have two entries with the same `Name`
-//     - within each entry:
-//       - must have at least one `Name`
-//       - must not have a `Name` with the `service` field unset or empty
-//       - within each `headers` entry:
-//         - must not have `required_match` set
-//         - must not have `key` unset or empty
-//       - across all `headers`, `constant_keys` and `extra_keys` fields:
-//         - must not have the same `key` specified twice
-//         - no `key` must be the empty string
-//   - `lookup_service` field must be set and and must parse as a target URI
-//   - if `max_age` > 5m, it should be set to 5 minutes
-//   - if `stale_age` > `max_age`, ignore it
-//   - if `stale_age` is set, then `max_age` must also be set
-//   - ignore `valid_targets` field
-//   - `cache_size_bytes` field must have a value greater than 0, and if its
-//      value is greater than 5M, we cap it at 5M
-// - routeLookupChannelServiceConfig:
-//   - if specified, must parse as valid service config
-// - childPolicy:
-//   - must find a valid child policy with a valid config
-// - childPolicyConfigTargetFieldName:
-//   - must be set and non-empty
+//	 When parsing a config update, the following validations are performed:
+//	 - routeLookupConfig:
+//	   - grpc_keybuilders field:
+//	     - must have at least one entry
+//	     - must not have two entries with the same `Name`
+//	     - within each entry:
+//	       - must have at least one `Name`
+//	       - must not have a `Name` with the `service` field unset or empty
+//	       - within each `headers` entry:
+//	         - must not have `required_match` set
+//	         - must not have `key` unset or empty
+//	       - across all `headers`, `constant_keys` and `extra_keys` fields:
+//	         - must not have the same `key` specified twice
+//	         - no `key` must be the empty string
+//	   - `lookup_service` field must be set and must parse as a target URI
+//	   - if `max_age` > 5m, it should be set to 5 minutes
+//	   - if `stale_age` > `max_age`, ignore it
+//	   - if `stale_age` is set, then `max_age` must also be set
+//	   - ignore `valid_targets` field
+//	   - `cache_size_bytes` field must have a value greater than 0, and if its
+//	     value is greater than 5M, we cap it at 5M
+//
+//	- routeLookupChannelServiceConfig:
+//	  - if specified, must parse as valid service config
+//
+//	- childPolicy:
+//	  - must find a valid child policy with a valid config
+//
+//	- childPolicyConfigTargetFieldName:
+//	  - must be set and non-empty
 func (rlsBB) ParseConfig(c json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
-	logger.Infof("Received JSON service config: %v", pretty.ToJSON(c))
+	if logger.V(2) {
+		logger.Infof("Received JSON service config: %v", pretty.ToJSON(c))
+	}
+
 	cfgJSON := &lbConfigJSON{}
 	if err := json.Unmarshal(c, cfgJSON); err != nil {
 		return nil, fmt.Errorf("rls: json unmarshal failed for service config %+v: %v", string(c), err)
@@ -185,7 +190,7 @@ func parseRLSProto(rlsProto *rlspb.RouteLookupConfig) (*lbConfig, error) {
 		return nil, err
 	}
 
-	// `lookup_service` field must be set and and must parse as a target URI.
+	// `lookup_service` field must be set and must parse as a target URI.
 	lookupService := rlsProto.GetLookupService()
 	if lookupService == "" {
 		return nil, fmt.Errorf("rls: empty lookup_service in route lookup config %+v", rlsProto)
@@ -305,5 +310,5 @@ func convertDuration(d *durationpb.Duration) (time.Duration, error) {
 	if d == nil {
 		return 0, nil
 	}
-	return ptypes.Duration(d)
+	return d.AsDuration(), d.CheckValid()
 }

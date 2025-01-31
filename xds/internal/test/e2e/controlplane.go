@@ -18,11 +18,10 @@
 package e2e
 
 import (
-	"fmt"
+	"testing"
 
 	"github.com/google/uuid"
-	xdsinternal "google.golang.org/grpc/internal/xds"
-	"google.golang.org/grpc/xds/internal/testutils/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e"
 )
 
 type controlPlane struct {
@@ -31,32 +30,16 @@ type controlPlane struct {
 	bootstrapContent string
 }
 
-func newControlPlane() (*controlPlane, error) {
+func newControlPlane(t *testing.T) (*controlPlane, error) {
 	// Spin up an xDS management server on a local port.
-	server, err := e2e.StartManagementServer()
-	if err != nil {
-		return nil, fmt.Errorf("failed to spin up the xDS management server: %v", err)
-	}
+	server := e2e.StartManagementServer(t, e2e.ManagementServerOptions{})
 
 	nodeID := uuid.New().String()
-	bootstrapContentBytes, err := xdsinternal.BootstrapContents(xdsinternal.BootstrapOptions{
-		Version:                            xdsinternal.TransportV3,
-		NodeID:                             nodeID,
-		ServerURI:                          server.Address,
-		ServerListenerResourceNameTemplate: e2e.ServerListenerResourceNameTemplate,
-	})
-	if err != nil {
-		server.Stop()
-		return nil, fmt.Errorf("failed to create bootstrap file: %v", err)
-	}
+	bootstrapContents := e2e.DefaultBootstrapContents(t, nodeID, server.Address)
 
 	return &controlPlane{
 		server:           server,
 		nodeID:           nodeID,
-		bootstrapContent: string(bootstrapContentBytes),
+		bootstrapContent: string(bootstrapContents),
 	}, nil
-}
-
-func (cp *controlPlane) stop() {
-	cp.server.Stop()
 }

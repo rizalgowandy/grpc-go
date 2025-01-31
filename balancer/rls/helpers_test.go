@@ -20,9 +20,7 @@ package rls
 
 import (
 	"context"
-	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -30,18 +28,17 @@ import (
 	"google.golang.org/grpc/balancer/rls/internal/test/e2e"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal"
-	"google.golang.org/grpc/internal/balancergroup"
+	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpctest"
 	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/internal/stubserver"
-	"google.golang.org/grpc/internal/testutils"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/status"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -49,10 +46,6 @@ const (
 	defaultTestTimeout      = 5 * time.Second
 	defaultTestShortTimeout = 100 * time.Millisecond
 )
-
-func init() {
-	balancergroup.DefaultSubBalancerCloseTimeout = time.Millisecond
-}
 
 type s struct {
 	grpctest.Tester
@@ -62,59 +55,13 @@ func Test(t *testing.T) {
 	grpctest.RunSubTests(t, s{})
 }
 
-// connWrapper wraps a net.Conn and pushes on a channel when closed.
-type connWrapper struct {
-	net.Conn
-	closeCh *testutils.Channel
-}
-
-func (cw *connWrapper) Close() error {
-	err := cw.Conn.Close()
-	cw.closeCh.Replace(nil)
-	return err
-}
-
-// listenerWrapper wraps a net.Listener and the returned net.Conn.
-//
-// It pushes on a channel whenever it accepts a new connection.
-type listenerWrapper struct {
-	net.Listener
-	newConnCh *testutils.Channel
-}
-
-func (l *listenerWrapper) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	closeCh := testutils.NewChannel()
-	conn := &connWrapper{Conn: c, closeCh: closeCh}
-	l.newConnCh.Send(conn)
-	return conn, nil
-}
-
-func newListenerWrapper(t *testing.T, lis net.Listener) *listenerWrapper {
-	if lis == nil {
-		var err error
-		lis, err = testutils.LocalTCPListener()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	return &listenerWrapper{
-		Listener:  lis,
-		newConnCh: testutils.NewChannel(),
-	}
-}
-
 // fakeBackoffStrategy is a fake implementation of the backoff.Strategy
 // interface, for tests to inject the backoff duration.
 type fakeBackoffStrategy struct {
 	backoff time.Duration
 }
 
-func (f *fakeBackoffStrategy) Backoff(retries int) time.Duration {
+func (f *fakeBackoffStrategy) Backoff(int) time.Duration {
 	return f.backoff
 }
 
@@ -152,18 +99,14 @@ func neverThrottlingThrottler() *fakeThrottler {
 	}
 }
 
-// oneTimeAllowingThrottler returns a fake throttler which does not throttle the
-// first request, but throttles everything that comes after. This is useful for
-// tests which need to set up a valid cache entry before testing other cases.
-func oneTimeAllowingThrottler() *fakeThrottler {
-	var once sync.Once
+// oneTimeAllowingThrottler returns a fake throttler which does not throttle
+// requests until the client RPC succeeds, but throttles everything that comes
+// after. This is useful for tests which need to set up a valid cache entry
+// before testing other cases.
+func oneTimeAllowingThrottler(firstRPCDone *grpcsync.Event) *fakeThrottler {
 	return &fakeThrottler{
-		throttleFunc: func() bool {
-			throttle := true
-			once.Do(func() { throttle = false })
-			return throttle
-		},
-		throttleCh: make(chan struct{}, 1),
+		throttleFunc: firstRPCDone.HasFired,
+		throttleCh:   make(chan struct{}, 1),
 	}
 }
 
@@ -171,29 +114,6 @@ func overrideAdaptiveThrottler(t *testing.T, f *fakeThrottler) {
 	origAdaptiveThrottler := newAdaptiveThrottler
 	newAdaptiveThrottler = func() adaptiveThrottler { return f }
 	t.Cleanup(func() { newAdaptiveThrottler = origAdaptiveThrottler })
-}
-
-// setupFakeRLSServer starts and returns a fake RouteLookupService server
-// listening on the given listener or on a random local port. Also returns a
-// channel for tests to get notified whenever the RouteLookup RPC is invoked on
-// the fake server.
-//
-// This function sets up the fake server to respond with an empty response for
-// the RouteLookup RPCs. Tests can override this by calling the
-// SetResponseCallback() method on the returned fake server.
-func setupFakeRLSServer(t *testing.T, lis net.Listener, opts ...grpc.ServerOption) (*e2e.FakeRouteLookupServer, chan struct{}) {
-	s, cancel := e2e.StartFakeRouteLookupServer(t, lis, opts...)
-	t.Logf("Started fake RLS server at %q", s.Address)
-
-	ch := make(chan struct{}, 1)
-	s.SetRequestCallback(func(request *rlspb.RouteLookupRequest) {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	})
-	t.Cleanup(cancel)
-	return s, ch
 }
 
 // buildBasicRLSConfig constructs a basic service config for the RLS LB policy
@@ -251,7 +171,7 @@ func startBackend(t *testing.T, sopts ...grpc.ServerOption) (rpcCh chan struct{}
 
 	rpcCh = make(chan struct{}, 1)
 	backend := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 			select {
 			case rpcCh <- struct{}{}:
 			default:
@@ -291,12 +211,12 @@ func startManualResolverWithConfig(t *testing.T, rlsConfig *e2e.RLSConfig) *manu
 //
 // There are many instances where it can take a while before the attempted RPC
 // reaches the expected backend. Examples include, but are not limited to:
-// - control channel is changed in a config update. The RLS LB policy creates a
-//   new control channel, and sends a new picker to gRPC. But it takes a while
-//   before gRPC actually starts using the new picker.
-// - test is waiting for a cache entry to expire after which we expect a
-//   different behavior because we have configured the fake RLS server to return
-//   different backends.
+//   - control channel is changed in a config update. The RLS LB policy creates a
+//     new control channel, and sends a new picker to gRPC. But it takes a while
+//     before gRPC actually starts using the new picker.
+//   - test is waiting for a cache entry to expire after which we expect a
+//     different behavior because we have configured the fake RLS server to return
+//     different backends.
 //
 // Therefore, we do not return an error when the RPC fails. Instead, we wait for
 // the context to expire before failing.
