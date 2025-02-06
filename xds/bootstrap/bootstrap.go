@@ -19,7 +19,7 @@
 // Package bootstrap provides the functionality to register possible options
 // for aspects of the xDS client through the bootstrap file.
 //
-// Experimental
+// # Experimental
 //
 // Notice: This package is EXPERIMENTAL and may be changed or removed
 // in a later release.
@@ -37,8 +37,10 @@ var registry = make(map[string]Credentials)
 // Credentials interface encapsulates a credentials.Bundle builder
 // that can be used for communicating with the xDS Management server.
 type Credentials interface {
-	// Build returns a credential bundle associated with this credential.
-	Build(config json.RawMessage) (credentials.Bundle, error)
+	// Build returns a credential bundle associated with this credential, and
+	// a function to cleans up additional resources associated with this bundle
+	// when it is no longer needed.
+	Build(config json.RawMessage) (credentials.Bundle, func(), error)
 	// Name returns the credential name associated with this credential.
 	Name() string
 }

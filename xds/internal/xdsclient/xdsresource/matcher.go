@@ -19,9 +19,9 @@ package xdsresource
 
 import (
 	"fmt"
+	rand "math/rand/v2"
 	"strings"
 
-	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/internal/grpcutil"
 	iresolver "google.golang.org/grpc/internal/resolver"
 	"google.golang.org/grpc/internal/xds/matcher"
@@ -59,6 +59,8 @@ func RouteToMatcher(r *Route) (*CompositeMatcher, error) {
 			matcherT = matcher.NewHeaderRangeMatcher(h.Name, h.RangeMatch.Start, h.RangeMatch.End, invert)
 		case h.PresentMatch != nil:
 			matcherT = matcher.NewHeaderPresentMatcher(h.Name, *h.PresentMatch, invert)
+		case h.StringMatch != nil:
+			matcherT = matcher.NewHeaderStringMatcher(h.Name, *h.StringMatch, invert)
 		default:
 			return nil, fmt.Errorf("illegal route: missing header_match_specifier")
 		}
@@ -140,11 +142,11 @@ func newFractionMatcher(fraction uint32) *fractionMatcher {
 	return &fractionMatcher{fraction: int64(fraction)}
 }
 
-// RandInt63n overwrites grpcrand for control in tests.
-var RandInt63n = grpcrand.Int63n
+// RandInt64n overwrites rand for control in tests.
+var RandInt64n = rand.Int64N
 
 func (fm *fractionMatcher) match() bool {
-	t := RandInt63n(1000000)
+	t := RandInt64n(1000000)
 	return t <= fm.fraction
 }
 
@@ -208,18 +210,21 @@ func match(domain, host string) (domainMatchType, bool) {
 // FindBestMatchingVirtualHost returns the virtual host whose domains field best
 // matches host
 //
-// The domains field support 4 different matching pattern types:
-//  - Exact match
-//  - Suffix match (e.g. “*ABC”)
-//  - Prefix match (e.g. “ABC*)
-//  - Universal match (e.g. “*”)
+//	The domains field support 4 different matching pattern types:
 //
-// The best match is defined as:
-//  - A match is better if it’s matching pattern type is better
-//    - Exact match > suffix match > prefix match > universal match
-//  - If two matches are of the same pattern type, the longer match is better
-//    - This is to compare the length of the matching pattern, e.g. “*ABCDE” >
-//    “*ABC”
+//	- Exact match
+//	- Suffix match (e.g. “*ABC”)
+//	- Prefix match (e.g. “ABC*)
+//	- Universal match (e.g. “*”)
+//
+//	The best match is defined as:
+//	- A match is better if it’s matching pattern type is better.
+//	  * Exact match > suffix match > prefix match > universal match.
+//
+//	- If two matches are of the same pattern type, the longer match is
+//	  better.
+//	  * This is to compare the length of the matching pattern, e.g. “*ABCDE” >
+//	    “*ABC”
 func FindBestMatchingVirtualHost(host string, vHosts []*VirtualHost) *VirtualHost { // Maybe move this crap to client
 	var (
 		matchVh   *VirtualHost

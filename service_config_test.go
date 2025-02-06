@@ -21,33 +21,63 @@ package grpc
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"reflect"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/balancer/gracefulswitch"
 	"google.golang.org/grpc/serviceconfig"
+
+	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 )
 
 type parseTestCase struct {
+	name    string
 	scjs    string
 	wantSC  *ServiceConfig
 	wantErr bool
 }
 
+func lbConfigFor(t *testing.T, name string, cfg serviceconfig.LoadBalancingConfig) serviceconfig.LoadBalancingConfig {
+	if name == "" {
+		name = "pick_first"
+		cfg = struct {
+			serviceconfig.LoadBalancingConfig
+		}{}
+	}
+	d := []map[string]any{{name: cfg}}
+	strCfg, err := json.Marshal(d)
+	t.Logf("strCfg = %v", string(strCfg))
+	if err != nil {
+		t.Fatalf("Error parsing config: %v", err)
+	}
+	parsedCfg, err := gracefulswitch.ParseConfig(strCfg)
+	if err != nil {
+		t.Fatalf("Error parsing config: %v", err)
+	}
+	return parsedCfg
+}
+
 func runParseTests(t *testing.T, testCases []parseTestCase) {
 	t.Helper()
-	for _, c := range testCases {
-		scpr := parseServiceConfig(c.scjs)
-		var sc *ServiceConfig
-		sc, _ = scpr.Config.(*ServiceConfig)
-		if !c.wantErr {
-			c.wantSC.rawJSONString = c.scjs
+	for i, c := range testCases {
+		name := c.name
+		if name == "" {
+			name = fmt.Sprint(i)
 		}
-		if c.wantErr != (scpr.Err != nil) || !reflect.DeepEqual(sc, c.wantSC) {
-			t.Fatalf("parseServiceConfig(%s) = %+v, %v, want %+v, %v", c.scjs, sc, scpr.Err, c.wantSC, c.wantErr)
-		}
+		t.Run(name, func(t *testing.T) {
+			scpr := parseServiceConfig(c.scjs, defaultMaxCallAttempts)
+			var sc *ServiceConfig
+			sc, _ = scpr.Config.(*ServiceConfig)
+			if !c.wantErr {
+				c.wantSC.rawJSONString = c.scjs
+			}
+			if c.wantErr != (scpr.Err != nil) || !reflect.DeepEqual(sc, c.wantSC) {
+				t.Fatalf("parseServiceConfig(%s) = %+v, %v, want %+v, %v", c.scjs, sc, scpr.Err, c.wantSC, c.wantErr)
+			}
+		})
 	}
 }
 
@@ -71,7 +101,7 @@ func (parseBalancerBuilder) ParseConfig(c json.RawMessage) (serviceconfig.LoadBa
 	return d, nil
 }
 
-func (parseBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (parseBalancerBuilder) Build(balancer.ClientConn, balancer.BuildOptions) balancer.Balancer {
 	panic("unimplemented")
 }
 
@@ -82,14 +112,14 @@ func init() {
 func (s) TestParseLBConfig(t *testing.T) {
 	testcases := []parseTestCase{
 		{
-			`{
+			scjs: `{
     "loadBalancingConfig": [{"pbb": { "foo": "hi" } }]
 }`,
-			&ServiceConfig{
+			wantSC: &ServiceConfig{
 				Methods:  make(map[string]MethodConfig),
-				lbConfig: &lbConfig{name: "pbb", cfg: pbbData{Foo: "hi"}},
+				lbConfig: lbConfigFor(t, "pbb", pbbData{Foo: "hi"}),
 			},
-			false,
+			wantErr: false,
 		},
 	}
 	runParseTests(t, testcases)
@@ -115,7 +145,7 @@ func (s) TestParseNoLBConfigSupported(t *testing.T) {
 func (s) TestParseLoadBalancer(t *testing.T) {
 	testcases := []parseTestCase{
 		{
-			`{
+			scjs: `{
     "loadBalancingPolicy": "round_robin",
     "methodConfig": [
         {
@@ -129,18 +159,18 @@ func (s) TestParseLoadBalancer(t *testing.T) {
         }
     ]
 }`,
-			&ServiceConfig{
-				LB: newString("round_robin"),
+			wantSC: &ServiceConfig{
 				Methods: map[string]MethodConfig{
 					"/foo/Bar": {
 						WaitForReady: newBool(true),
 					},
 				},
+				lbConfig: lbConfigFor(t, "round_robin", nil),
 			},
-			false,
+			wantErr: false,
 		},
 		{
-			`{
+			scjs: `{
     "loadBalancingPolicy": 1,
     "methodConfig": [
         {
@@ -154,8 +184,7 @@ func (s) TestParseLoadBalancer(t *testing.T) {
         }
     ]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 	}
 	runParseTests(t, testcases)
@@ -164,7 +193,7 @@ func (s) TestParseLoadBalancer(t *testing.T) {
 func (s) TestParseWaitForReady(t *testing.T) {
 	testcases := []parseTestCase{
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -177,17 +206,17 @@ func (s) TestParseWaitForReady(t *testing.T) {
         }
     ]
 }`,
-			&ServiceConfig{
+			wantSC: &ServiceConfig{
 				Methods: map[string]MethodConfig{
 					"/foo/Bar": {
 						WaitForReady: newBool(true),
 					},
 				},
+				lbConfig: lbConfigFor(t, "", nil),
 			},
-			false,
 		},
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -200,17 +229,17 @@ func (s) TestParseWaitForReady(t *testing.T) {
         }
     ]
 }`,
-			&ServiceConfig{
+			wantSC: &ServiceConfig{
 				Methods: map[string]MethodConfig{
 					"/foo/Bar": {
 						WaitForReady: newBool(false),
 					},
 				},
+				lbConfig: lbConfigFor(t, "", nil),
 			},
-			false,
 		},
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -232,8 +261,7 @@ func (s) TestParseWaitForReady(t *testing.T) {
         }
     ]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 	}
 
@@ -243,7 +271,7 @@ func (s) TestParseWaitForReady(t *testing.T) {
 func (s) TestParseTimeOut(t *testing.T) {
 	testcases := []parseTestCase{
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -256,17 +284,17 @@ func (s) TestParseTimeOut(t *testing.T) {
         }
     ]
 }`,
-			&ServiceConfig{
+			wantSC: &ServiceConfig{
 				Methods: map[string]MethodConfig{
 					"/foo/Bar": {
 						Timeout: newDuration(time.Second),
 					},
 				},
+				lbConfig: lbConfigFor(t, "", nil),
 			},
-			false,
 		},
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -279,11 +307,10 @@ func (s) TestParseTimeOut(t *testing.T) {
         }
     ]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -305,8 +332,7 @@ func (s) TestParseTimeOut(t *testing.T) {
         }
     ]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 	}
 
@@ -316,7 +342,7 @@ func (s) TestParseTimeOut(t *testing.T) {
 func (s) TestParseMsgSize(t *testing.T) {
 	testcases := []parseTestCase{
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -330,18 +356,18 @@ func (s) TestParseMsgSize(t *testing.T) {
         }
     ]
 }`,
-			&ServiceConfig{
+			wantSC: &ServiceConfig{
 				Methods: map[string]MethodConfig{
 					"/foo/Bar": {
 						MaxReqSize:  newInt(1024),
 						MaxRespSize: newInt(2048),
 					},
 				},
+				lbConfig: lbConfigFor(t, "", nil),
 			},
-			false,
 		},
 		{
-			`{
+			scjs: `{
     "methodConfig": [
         {
             "name": [
@@ -365,8 +391,7 @@ func (s) TestParseMsgSize(t *testing.T) {
         }
     ]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 	}
 
@@ -377,58 +402,54 @@ func (s) TestParseDefaultMethodConfig(t *testing.T) {
 		Methods: map[string]MethodConfig{
 			"": {WaitForReady: newBool(true)},
 		},
+		lbConfig: lbConfigFor(t, "", nil),
 	}
 
 	runParseTests(t, []parseTestCase{
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [{}],
     "waitForReady": true
   }]
 }`,
-			dc,
-			false,
+			wantSC: dc,
 		},
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [{"service": null}],
     "waitForReady": true
   }]
 }`,
-			dc,
-			false,
+			wantSC: dc,
 		},
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [{"service": ""}],
     "waitForReady": true
   }]
 }`,
-			dc,
-			false,
+			wantSC: dc,
 		},
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [{"method": "Bar"}],
     "waitForReady": true
   }]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [{"service": "", "method": "Bar"}],
     "waitForReady": true
   }]
 }`,
-			nil,
-			true,
+			wantErr: true,
 		},
 	})
 }
@@ -436,7 +457,7 @@ func (s) TestParseDefaultMethodConfig(t *testing.T) {
 func (s) TestParseMethodConfigDuplicatedName(t *testing.T) {
 	runParseTests(t, []parseTestCase{
 		{
-			`{
+			scjs: `{
   "methodConfig": [{
     "name": [
       {"service": "foo"},
@@ -444,58 +465,139 @@ func (s) TestParseMethodConfigDuplicatedName(t *testing.T) {
     ],
     "waitForReady": true
   }]
-}`, nil, true,
+}`,
+			wantErr: true,
 		},
 	})
 }
 
-func (s) TestParseDuration(t *testing.T) {
-	testCases := []struct {
-		s    *string
-		want *time.Duration
-		err  bool
-	}{
-		{s: nil, want: nil},
-		{s: newString("1s"), want: newDuration(time.Second)},
-		{s: newString("-1s"), want: newDuration(-time.Second)},
-		{s: newString("1.1s"), want: newDuration(1100 * time.Millisecond)},
-		{s: newString("1.s"), want: newDuration(time.Second)},
-		{s: newString("1.0s"), want: newDuration(time.Second)},
-		{s: newString(".002s"), want: newDuration(2 * time.Millisecond)},
-		{s: newString(".002000s"), want: newDuration(2 * time.Millisecond)},
-		{s: newString("0.003s"), want: newDuration(3 * time.Millisecond)},
-		{s: newString("0.000004s"), want: newDuration(4 * time.Microsecond)},
-		{s: newString("5000.000000009s"), want: newDuration(5000*time.Second + 9*time.Nanosecond)},
-		{s: newString("4999.999999999s"), want: newDuration(5000*time.Second - time.Nanosecond)},
-		{s: newString("1"), err: true},
-		{s: newString("s"), err: true},
-		{s: newString(".s"), err: true},
-		{s: newString("1 s"), err: true},
-		{s: newString(" 1s"), err: true},
-		{s: newString("1ms"), err: true},
-		{s: newString("1.1.1s"), err: true},
-		{s: newString("Xs"), err: true},
-		{s: newString("as"), err: true},
-		{s: newString(".0000000001s"), err: true},
-		{s: newString(fmt.Sprint(math.MaxInt32) + "s"), want: newDuration(math.MaxInt32 * time.Second)},
-		{s: newString(fmt.Sprint(int64(math.MaxInt32)+1) + "s"), err: true},
-	}
-	for _, tc := range testCases {
-		got, err := parseDuration(tc.s)
-		if tc.err != (err != nil) ||
-			(got == nil) != (tc.want == nil) ||
-			(got != nil && *got != *tc.want) {
-			wantErr := "<nil>"
-			if tc.err {
-				wantErr = "<non-nil error>"
-			}
-			s := "<nil>"
-			if tc.s != nil {
-				s = `&"` + *tc.s + `"`
-			}
-			t.Errorf("parseDuration(%v) = %v, %v; want %v, %v", s, got, err, tc.want, wantErr)
-		}
-	}
+func (s) TestParseRetryPolicy(t *testing.T) {
+	runParseTests(t, []parseTestCase{
+		{
+			name: "valid",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					"maxAttempts": 2,
+					"initialBackoff": "2s",
+					"maxBackoff": "10s",
+					"backoffMultiplier": 2,
+					"retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantSC: &ServiceConfig{
+				Methods: map[string]MethodConfig{
+					"/foo/": {
+						RetryPolicy: &internalserviceconfig.RetryPolicy{
+							MaxAttempts:          2,
+							InitialBackoff:       2 * time.Second,
+							MaxBackoff:           10 * time.Second,
+							BackoffMultiplier:    2,
+							RetryableStatusCodes: map[codes.Code]bool{codes.Unavailable: true},
+						},
+					},
+				},
+				lbConfig: lbConfigFor(t, "", nil),
+			},
+		},
+		{
+			name: "negative maxAttempts",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "maxAttempts": -1,
+					  "initialBackoff": "2s",
+					  "maxBackoff": "10s",
+					  "backoffMultiplier": 2,
+					  "retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+		{
+			name: "missing maxAttempts",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "initialBackoff": "2s",
+					  "maxBackoff": "10s",
+					  "backoffMultiplier": 2,
+					  "retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+		{
+			name: "zero initialBackoff",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "maxAttempts": 2,
+					  "initialBackoff": "0s",
+					  "maxBackoff": "10s",
+					  "backoffMultiplier": 2,
+					  "retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+		{
+			name: "zero maxBackoff",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "maxAttempts": 2,
+					  "initialBackoff": "2s",
+					  "maxBackoff": "0s",
+					  "backoffMultiplier": 2,
+					  "retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+		{
+			name: "zero backoffMultiplier",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "maxAttempts": 2,
+					  "initialBackoff": "2s",
+					  "maxBackoff": "10s",
+					  "backoffMultiplier": 0,
+					  "retryableStatusCodes": ["UNAVAILABLE"]
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+		{
+			name: "no retryable codes",
+			scjs: `{
+				"methodConfig": [{
+				  "name": [{"service": "foo"}],
+				  "retryPolicy": {
+					  "maxAttempts": 2,
+					  "initialBackoff": "2s",
+					  "maxBackoff": "10s",
+					  "backoffMultiplier": 2,
+					  "retryableStatusCodes": []
+				  }
+				}]
+			  }`,
+			wantErr: true,
+		},
+	})
 }
 
 func newBool(b bool) *bool {
@@ -503,9 +605,5 @@ func newBool(b bool) *bool {
 }
 
 func newDuration(b time.Duration) *time.Duration {
-	return &b
-}
-
-func newString(b string) *string {
 	return &b
 }

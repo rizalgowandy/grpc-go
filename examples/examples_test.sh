@@ -51,27 +51,40 @@ pass () {
 EXAMPLES=(
     "helloworld"
     "route_guide"
+    "features/advancedtls"
     "features/authentication"
+    "features/authz"
+    "features/cancellation"
     "features/compression"
+    "features/customloadbalancer"
     "features/deadline"
     "features/encryption/TLS"
-    "features/errors"
+    "features/error_details"
+    "features/error_handling"
+    "features/flow_control"
     "features/interceptor"
     "features/load_balancing"
     "features/metadata"
+    "features/metadata_interceptor"
     "features/multiplex"
     "features/name_resolving"
+    "features/orca"
+    "features/retry"
     "features/unix_abstract"
+    "features/gracefulstop"
 )
 
 declare -A SERVER_ARGS=(
     ["features/unix_abstract"]="-addr $UNIX_ADDR"
     ["default"]="-port $SERVER_PORT"
+    ["features/advancedtls"]="-credentials_directory $(dirname $(realpath "$0"))/features/advancedtls/creds"
 )
 
 declare -A CLIENT_ARGS=(
     ["features/unix_abstract"]="-addr $UNIX_ADDR"
+    ["features/orca"]="-test=true"
     ["default"]="-addr localhost:$SERVER_PORT"
+    ["features/advancedtls"]="-credentials_directory $(dirname $(realpath "$0"))/features/advancedtls/creds"
 )
 
 declare -A SERVER_WAIT_COMMAND=(
@@ -98,32 +111,52 @@ declare -A EXPECTED_SERVER_OUTPUT=(
     ["helloworld"]="Received: world"
     ["route_guide"]=""
     ["features/authentication"]="server starting on port 50051..."
+    ["features/authz"]="unary echoing message \"hello world\""
+    ["features/cancellation"]="server: error receiving from stream: rpc error: code = Canceled desc = context canceled"
     ["features/compression"]="UnaryEcho called with message \"compress\""
+    ["features/customloadbalancer"]="serving on localhost:50051"
     ["features/deadline"]=""
     ["features/encryption/TLS"]=""
-    ["features/errors"]=""
+    ["features/error_details"]=""
+    ["features/error_handling"]=""
+    ["features/flow_control"]="Stream ended successfully."
     ["features/interceptor"]="unary echoing message \"hello world\""
     ["features/load_balancing"]="serving on :50051"
     ["features/metadata"]="message:\"this is examples/metadata\", sending echo"
+    ["features/metadata_interceptor"]="key1 from metadata: "
     ["features/multiplex"]=":50051"
     ["features/name_resolving"]="serving on localhost:50051"
+    ["features/orca"]="Server listening"
+    ["features/retry"]="request succeeded count: 4"
     ["features/unix_abstract"]="serving on @abstract-unix-socket"
+    ["features/advancedtls"]=""
+    ["features/gracefulstop"]="Server stopped gracefully."
 )
 
 declare -A EXPECTED_CLIENT_OUTPUT=(
     ["helloworld"]="Greeting: Hello world"
     ["route_guide"]="Feature: name: \"\", point:(416851321, -742674555)"
     ["features/authentication"]="UnaryEcho:  hello world"
+    ["features/authz"]="UnaryEcho:  hello world"
+    ["features/cancellation"]="cancelling context"
     ["features/compression"]="UnaryEcho call returned \"compress\", <nil>"
+    ["features/customloadbalancer"]="Successful multiple iterations of 1:2 ratio"
     ["features/deadline"]="wanted = DeadlineExceeded, got = DeadlineExceeded"
     ["features/encryption/TLS"]="UnaryEcho:  hello world"
-    ["features/errors"]="Greeting: Hello world"
+    ["features/error_details"]="Greeting: Hello world"
+    ["features/error_handling"]="Received error"
+    ["features/flow_control"]="Stream ended successfully."
     ["features/interceptor"]="UnaryEcho:  hello world"
     ["features/load_balancing"]="calling helloworld.Greeter/SayHello with pick_first"
     ["features/metadata"]="this is examples/metadata"
+    ["features/metadata_interceptor"]="BidiStreaming Echo:  hello world"
     ["features/multiplex"]="Greeting:  Hello multiplex"
     ["features/name_resolving"]="calling helloworld.Greeter/SayHello to \"example:///resolver.example.grpc.io\""
+    ["features/orca"]="Per-call load report received: map\[db_queries:10\]"
+    ["features/retry"]="UnaryEcho reply: message:\"Try and Success\""
     ["features/unix_abstract"]="calling echo.Echo/UnaryEcho to unix-abstract:abstract-unix-socket"
+    ["features/advancedtls"]=""
+    ["features/gracefulstop"]="Successful unary requests processed by server and made by client are same."
 )
 
 cd ./examples
@@ -163,7 +196,7 @@ for example in ${EXAMPLES[@]}; do
         $(cat $CLIENT_LOG)
         "
     else
-        pass "client successfully communitcated with server"
+        pass "client successfully communicated with server"
     fi
 
     # Check server log for expected output if expecting an

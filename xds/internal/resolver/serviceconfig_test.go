@@ -20,17 +20,27 @@ package resolver
 
 import (
 	"context"
-	"fmt"
 	"regexp"
 	"testing"
 
 	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/grpcutil"
 	iresolver "google.golang.org/grpc/internal/resolver"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/metadata"
 	_ "google.golang.org/grpc/xds/internal/balancer/cdsbalancer" // To parse LB config
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
 )
+
+type s struct {
+	grpctest.Tester
+}
+
+func Test(t *testing.T) {
+	grpctest.RunSubTests(t, s{})
+}
 
 func (s) TestPruneActiveClusters(t *testing.T) {
 	r := &xdsResolver{activeClusters: map[string]*clusterInfo{
@@ -50,9 +60,11 @@ func (s) TestPruneActiveClusters(t *testing.T) {
 }
 
 func (s) TestGenerateRequestHash(t *testing.T) {
+	const channelID = 12378921
 	cs := &configSelector{
 		r: &xdsResolver{
-			cc: &testClientConn{},
+			cc:        &testutils.ResolverClientConn{Logger: t},
+			channelID: channelID,
 		},
 	}
 	tests := []struct {
@@ -85,7 +97,7 @@ func (s) TestGenerateRequestHash(t *testing.T) {
 			hashPolicies: []*xdsresource.HashPolicy{{
 				HashPolicyType: xdsresource.HashPolicyTypeChannelID,
 			}},
-			requestHashWant: xxhash.Sum64String(fmt.Sprintf("%p", &cs.r.cc)),
+			requestHashWant: channelID,
 			rpcInfo:         iresolver.RPCInfo{},
 		},
 		// TestGenerateRequestHashEmptyString tests generating request hashes
@@ -103,6 +115,35 @@ func (s) TestGenerateRequestHash(t *testing.T) {
 			rpcInfo: iresolver.RPCInfo{
 				Context: metadata.NewOutgoingContext(context.Background(), metadata.Pairs(":path", "abc")),
 				Method:  "/some-method",
+			},
+		},
+		// Tests that bin headers are skipped.
+		{
+			name: "skip-bin",
+			hashPolicies: []*xdsresource.HashPolicy{{
+				HashPolicyType: xdsresource.HashPolicyTypeHeader,
+				HeaderName:     "something-bin",
+			}, {
+				HashPolicyType: xdsresource.HashPolicyTypeChannelID,
+			}},
+			requestHashWant: channelID,
+			rpcInfo: iresolver.RPCInfo{
+				Context: metadata.NewOutgoingContext(context.Background(), metadata.Pairs("something-bin", "xyz")),
+			},
+		},
+		// Tests that extra metadata takes precedence over the user's metadata.
+		{
+			name: "extra-metadata",
+			hashPolicies: []*xdsresource.HashPolicy{{
+				HashPolicyType: xdsresource.HashPolicyTypeHeader,
+				HeaderName:     "content-type",
+			}},
+			requestHashWant: xxhash.Sum64String("grpc value"),
+			rpcInfo: iresolver.RPCInfo{
+				Context: grpcutil.WithExtraMetadata(
+					metadata.NewOutgoingContext(context.Background(), metadata.Pairs("content-type", "user value")),
+					metadata.Pairs("content-type", "grpc value"),
+				),
 			},
 		},
 	}
