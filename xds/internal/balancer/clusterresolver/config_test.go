@@ -21,12 +21,16 @@ package clusterresolver
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"google.golang.org/grpc/internal/balancer/stub"
-	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/balancer/roundrobin"
+	iserviceconfig "google.golang.org/grpc/internal/serviceconfig"
+	"google.golang.org/grpc/internal/xds/bootstrap"
+	"google.golang.org/grpc/xds/internal/balancer/outlierdetection"
 	"google.golang.org/grpc/xds/internal/balancer/ringhash"
-	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
 )
 
 func TestDiscoveryMechanismTypeMarshalJSON(t *testing.T) {
@@ -91,14 +95,6 @@ func TestDiscoveryMechanismTypeUnmarshalJSON(t *testing.T) {
 	}
 }
 
-func init() {
-	// This is needed now for the config parsing tests to pass. Otherwise they
-	// will fail with "RING_HASH unsupported".
-	//
-	// TODO: delete this once ring-hash policy is implemented and imported.
-	stub.Register(rhName, stub.BalancerFuncs{})
-}
-
 const (
 	testJSONConfig1 = `{
   "discoveryMechanisms": [{
@@ -109,8 +105,10 @@ const (
     },
     "maxConcurrentRequests": 314,
     "type": "EDS",
-    "edsServiceName": "test-eds-service-name"
-  }]
+    "edsServiceName": "test-eds-service-name",
+    "outlierDetection": {}
+  }],
+  "xdsLbPolicy":[{"round_robin":{}}]
 }`
 	testJSONConfig2 = `{
   "discoveryMechanisms": [{
@@ -121,10 +119,13 @@ const (
     },
     "maxConcurrentRequests": 314,
     "type": "EDS",
-    "edsServiceName": "test-eds-service-name"
+    "edsServiceName": "test-eds-service-name",
+    "outlierDetection": {}
   },{
-    "type": "LOGICAL_DNS"
-  }]
+    "type": "LOGICAL_DNS",
+    "outlierDetection": {}
+  }],
+  "xdsLbPolicy":[{"round_robin":{}}]
 }`
 	testJSONConfig3 = `{
   "discoveryMechanisms": [{
@@ -135,9 +136,10 @@ const (
     },
     "maxConcurrentRequests": 314,
     "type": "EDS",
-    "edsServiceName": "test-eds-service-name"
+    "edsServiceName": "test-eds-service-name",
+    "outlierDetection": {}
   }],
-  "xdsLbPolicy":[{"ROUND_ROBIN":{}}]
+  "xdsLbPolicy":[{"round_robin":{}}]
 }`
 	testJSONConfig4 = `{
   "discoveryMechanisms": [{
@@ -148,7 +150,8 @@ const (
     },
     "maxConcurrentRequests": 314,
     "type": "EDS",
-    "edsServiceName": "test-eds-service-name"
+    "edsServiceName": "test-eds-service-name",
+    "outlierDetection": {}
   }],
   "xdsLbPolicy":[{"ring_hash_experimental":{}}]
 }`
@@ -161,18 +164,21 @@ const (
     },
     "maxConcurrentRequests": 314,
     "type": "EDS",
-    "edsServiceName": "test-eds-service-name"
+    "edsServiceName": "test-eds-service-name",
+    "outlierDetection": {}
   }],
-  "xdsLbPolicy":[{"pick_first":{}}]
+  "xdsLbPolicy":[{"round_robin":{}}]
 }`
 )
 
-var testLRSServerConfig = &bootstrap.ServerConfig{
-	ServerURI: "trafficdirector.googleapis.com:443",
-	CredsType: "google_default",
-}
-
 func TestParseConfig(t *testing.T) {
+	testLRSServerConfig, err := bootstrap.ServerConfigForTesting(bootstrap.ServerConfigTestingOptions{
+		URI:          "trafficdirector.googleapis.com:443",
+		ChannelCreds: []bootstrap.ChannelCreds{{Type: "google_default"}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create LRS server config for testing: %v", err)
+	}
 	tests := []struct {
 		name    string
 		js      string
@@ -195,10 +201,20 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
 					},
 				},
-				XDSLBPolicy: nil,
+				xdsLBPolicy: iserviceconfig.BalancerConfig{ // do we want to make this not pointer
+					Name:   roundrobin.Name,
+					Config: nil,
+				},
 			},
 			wantErr: false,
 		},
@@ -212,13 +228,30 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
 					},
 					{
 						Type: DiscoveryMechanismTypeLogicalDNS,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
 					},
 				},
-				XDSLBPolicy: nil,
+				xdsLBPolicy: iserviceconfig.BalancerConfig{
+					Name:   roundrobin.Name,
+					Config: nil,
+				},
 			},
 			wantErr: false,
 		},
@@ -232,11 +265,18 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
 					},
 				},
-				XDSLBPolicy: &internalserviceconfig.BalancerConfig{
-					Name:   "ROUND_ROBIN",
+				xdsLBPolicy: iserviceconfig.BalancerConfig{
+					Name:   roundrobin.Name,
 					Config: nil,
 				},
 			},
@@ -252,37 +292,73 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
 					},
 				},
-				XDSLBPolicy: &internalserviceconfig.BalancerConfig{
+				xdsLBPolicy: iserviceconfig.BalancerConfig{
 					Name:   ringhash.Name,
-					Config: nil,
+					Config: &ringhash.LBConfig{MinRingSize: 1024, MaxRingSize: 4096}, // Ringhash LB config with default min and max.
 				},
 			},
 			wantErr: false,
 		},
 		{
-			name:    "unsupported picking policy",
-			js:      testJSONConfig5,
-			wantErr: true,
+			name: "noop-outlier-detection",
+			js:   testJSONConfig5,
+			want: &LBConfig{
+				DiscoveryMechanisms: []DiscoveryMechanism{
+					{
+						Cluster:               testClusterName,
+						LoadReportingServer:   testLRSServerConfig,
+						MaxConcurrentRequests: newUint32(testMaxRequests),
+						Type:                  DiscoveryMechanismTypeEDS,
+						EDSServiceName:        testEDSService,
+						outlierDetection: outlierdetection.LBConfig{
+							Interval:           iserviceconfig.Duration(10 * time.Second), // default interval
+							BaseEjectionTime:   iserviceconfig.Duration(30 * time.Second),
+							MaxEjectionTime:    iserviceconfig.Duration(300 * time.Second),
+							MaxEjectionPercent: 10,
+							// sre and fpe are both nil
+						},
+					},
+				},
+				xdsLBPolicy: iserviceconfig.BalancerConfig{
+					Name:   roundrobin.Name,
+					Config: nil,
+				},
+			},
+			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
+		b := balancer.Get(Name)
+		if b == nil {
+			t.Fatalf("LB policy %q not registered", Name)
+		}
+		cfgParser, ok := b.(balancer.ConfigParser)
+		if !ok {
+			t.Fatalf("LB policy %q does not support config parsing", Name)
+		}
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseConfig([]byte(tt.js))
+			got, err := cfgParser.ParseConfig([]byte(tt.js))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("parseConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if diff := cmp.Diff(got, tt.want); diff != "" {
+			if tt.wantErr {
+				return
+			}
+			if diff := cmp.Diff(got, tt.want, cmp.AllowUnexported(LBConfig{}), cmpopts.IgnoreFields(LBConfig{}, "XDSLBPolicy")); diff != "" {
 				t.Errorf("parseConfig() got unexpected output, diff (-got +want): %v", diff)
 			}
 		})
 	}
-}
-
-func newString(s string) *string {
-	return &s
 }
 
 func newUint32(i uint32) *uint32 {

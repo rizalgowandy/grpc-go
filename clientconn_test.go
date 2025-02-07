@@ -25,23 +25,47 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	internalbackoff "google.golang.org/grpc/internal/backoff"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpcsync"
+	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
+	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/testdata"
 )
+
+const (
+	defaultTestTimeout         = 10 * time.Second
+	stateRecordingBalancerName = "state_recording_balancer"
+)
+
+var testBalancerBuilder = newStateRecordingBalancerBuilder()
+
+func init() {
+	balancer.Register(testBalancerBuilder)
+}
+
+func parseCfg(r *manual.Resolver, s string) *serviceconfig.ParseResult {
+	scpr := r.CC.ParseServiceConfig(s)
+	if scpr.Err != nil {
+		panic(fmt.Sprintf("Error parsing config %q: %v", s, scpr.Err))
+	}
+	return scpr
+}
 
 func (s) TestDialWithTimeout(t *testing.T) {
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -212,8 +236,10 @@ func (s) TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 		lis.Addr().String(),
 		WithTransportCredentials(insecure.NewCredentials()),
 		WithReturnConnectionError(),
-		withBackoff(noBackoff{}),
-		withMinConnectDeadline(func() time.Duration { return time.Second / 4 }))
+		WithConnectParams(ConnectParams{
+			Backoff:           backoff.Config{},
+			MinConnectTimeout: 250 * time.Millisecond,
+		}))
 	lis.Close()
 	if err == nil {
 		client.Close()
@@ -301,7 +327,7 @@ func (s) TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 	case <-timer.C:
 		t.Fatalf("Client didn't make another connection request in time.")
 	}
-	// Make sure the connection stays alive for sometime.
+	// Make sure the connection stays alive for some time.
 	time.Sleep(time.Second)
 	atomic.StoreUint32(&over, 1)
 	client.Close()
@@ -311,7 +337,7 @@ func (s) TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 func (s) TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		t.Fatalf("Error while listening. Err: %v", err)
+		t.Fatalf("Unexpected error from net.Listen(%q, %q): %v", "tcp", "localhost:0", err)
 	}
 	defer lis.Close()
 	done := make(chan struct{})
@@ -343,9 +369,19 @@ func (s) TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 			prevAt = meow
 		}
 	}()
-	cc, err := Dial(lis.Addr().String(), WithTransportCredentials(insecure.NewCredentials()))
+	bc := backoff.Config{
+		BaseDelay:  200 * time.Millisecond,
+		Multiplier: 2.0,
+		Jitter:     0,
+		MaxDelay:   120 * time.Second,
+	}
+	cp := ConnectParams{
+		Backoff:           bc,
+		MinConnectTimeout: 1 * time.Second,
+	}
+	cc, err := Dial(lis.Addr().String(), WithTransportCredentials(insecure.NewCredentials()), WithConnectParams(cp))
 	if err != nil {
-		t.Fatalf("Error while dialing. Err: %v", err)
+		t.Fatalf("Unexpected error from Dial(%v) = %v", lis.Addr(), err)
 	}
 	defer cc.Close()
 	go stayConnected(cc)
@@ -383,17 +419,21 @@ func (s) TestWithTransportCredentialsTLS(t *testing.T) {
 
 // When creating a transport configured with n addresses, only calculate the
 // backoff once per "round" of attempts instead of once per address (n times
-// per "round" of attempts).
-func (s) TestDial_OneBackoffPerRetryGroup(t *testing.T) {
+// per "round" of attempts) for old pickfirst and once per address for new pickfirst.
+func (s) TestDial_BackoffCountPerRetryGroup(t *testing.T) {
 	var attempts uint32
+	wantBackoffs := uint32(1)
+	if envconfig.NewPickFirstEnabled {
+		wantBackoffs = 2
+	}
 	getMinConnectTimeout := func() time.Duration {
-		if atomic.AddUint32(&attempts, 1) == 1 {
+		if atomic.AddUint32(&attempts, 1) <= wantBackoffs {
 			// Once all addresses are exhausted, hang around and wait for the
 			// client.Close to happen rather than re-starting a new round of
 			// attempts.
 			return time.Hour
 		}
-		t.Error("only one attempt backoff calculation, but got more")
+		t.Errorf("only %d attempt backoff calculation, but got more", wantBackoffs)
 		return 0
 	}
 
@@ -444,7 +484,6 @@ func (s) TestDial_OneBackoffPerRetryGroup(t *testing.T) {
 	}})
 	client, err := DialContext(ctx, "whatever:///this-gets-overwritten",
 		WithTransportCredentials(insecure.NewCredentials()),
-		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)),
 		WithResolvers(rb),
 		withMinConnectDeadline(getMinConnectTimeout))
 	if err != nil {
@@ -464,6 +503,10 @@ func (s) TestDial_OneBackoffPerRetryGroup(t *testing.T) {
 	case <-timeout:
 		t.Fatal("timed out waiting for test to finish")
 	case <-server2Done:
+	}
+
+	if got, want := atomic.LoadUint32(&attempts), wantBackoffs; got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
 	}
 }
 
@@ -608,7 +651,7 @@ func (s) TestConnectParamsWithMinConnectTimeout(t *testing.T) {
 	defer conn.Close()
 
 	if got := conn.dopts.minConnectTimeout(); got != mct {
-		t.Errorf("unexpect minConnectTimeout on the connection: %v, want %v", got, mct)
+		t.Errorf("unexpected minConnectTimeout on the connection: %v, want %v", got, mct)
 	}
 }
 
@@ -658,6 +701,8 @@ func (s) TestResolverEmptyUpdateNotPanic(t *testing.T) {
 }
 
 func (s) TestClientUpdatesParamsAfterGoAway(t *testing.T) {
+	grpctest.TLogger.ExpectError("Client received GoAway with error code ENHANCE_YOUR_CALM and debug data equal to ASCII \"too_many_pings\"")
+
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Failed to listen. Err: %v", err)
@@ -708,7 +753,7 @@ func (s) TestClientUpdatesParamsAfterGoAway(t *testing.T) {
 	for {
 		time.Sleep(10 * time.Millisecond)
 		cc.mu.RLock()
-		v := cc.mkp.Time
+		v := cc.keepaliveParams.Time
 		cc.mu.RUnlock()
 		if v == 20*time.Second {
 			// Success
@@ -772,15 +817,47 @@ func (s) TestMethodConfigDefaultService(t *testing.T) {
 	}
 }
 
-func (s) TestGetClientConnTarget(t *testing.T) {
-	addr := "nonexist:///non.existent"
-	cc, err := Dial(addr, WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("Dial(%s, _) = _, %v, want _, <nil>", addr, err)
+func (s) TestClientConnCanonicalTarget(t *testing.T) {
+	tests := []struct {
+		name                string
+		addr                string
+		canonicalTargetWant string
+	}{
+		{
+			name:                "normal-case",
+			addr:                "dns://a.server.com/google.com",
+			canonicalTargetWant: "dns://a.server.com/google.com",
+		},
+		{
+			name:                "canonical-target-not-specified",
+			addr:                "no.scheme",
+			canonicalTargetWant: "passthrough:///no.scheme",
+		},
+		{
+			name:                "canonical-target-nonexistent",
+			addr:                "nonexist:///non.existent",
+			canonicalTargetWant: "passthrough:///nonexist:///non.existent",
+		},
+		{
+			name:                "canonical-target-add-colon-slash",
+			addr:                "dns:hostname:port",
+			canonicalTargetWant: "dns:///hostname:port",
+		},
 	}
-	defer cc.Close()
-	if cc.Target() != addr {
-		t.Fatalf("Target() = %s, want %s", cc.Target(), addr)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cc, err := Dial(test.addr, WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("Dial(%s, _) = _, %v, want _, <nil>", test.addr, err)
+			}
+			defer cc.Close()
+			if cc.Target() != test.addr {
+				t.Fatalf("Target() = %s, want %s", cc.Target(), test.addr)
+			}
+			if cc.CanonicalTarget() != test.canonicalTargetWant {
+				t.Fatalf("CanonicalTarget() = %s, want %s", cc.CanonicalTarget(), test.canonicalTargetWant)
+			}
+		})
 	}
 }
 
@@ -836,14 +913,19 @@ func (s) TestBackoffCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create ClientConn: %v", err)
 	}
-	<-dialStrCh
-	cc.Close()
-	// Should not leak. May need -count 5000 to exercise.
+	defer cc.Close()
+
+	select {
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("Timeout when waiting for custom dialer to be invoked during Dial")
+	case <-dialStrCh:
+	}
 }
 
-// UpdateAddresses should cause the next reconnect to begin from the top of the
-// list if the connection is not READY.
-func (s) TestUpdateAddresses_RetryFromFirstAddr(t *testing.T) {
+// TestUpdateAddresses_NoopIfCalledWithSameAddresses tests that UpdateAddresses
+// should be noop if UpdateAddresses is called with the same list of addresses,
+// even when the SubConn is in Connecting and doesn't have a current address.
+func (s) TestUpdateAddresses_NoopIfCalledWithSameAddresses(t *testing.T) {
 	lis1, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
@@ -962,9 +1044,11 @@ func (s) TestUpdateAddresses_RetryFromFirstAddr(t *testing.T) {
 	client, err := Dial("whatever:///this-gets-overwritten",
 		WithTransportCredentials(insecure.NewCredentials()),
 		WithResolvers(rb),
-		withBackoff(noBackoff{}),
-		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)),
-		withMinConnectDeadline(func() time.Duration { return time.Hour }))
+		WithConnectParams(ConnectParams{
+			Backoff:           backoff.Config{},
+			MinConnectTimeout: time.Hour,
+		}),
+		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -987,36 +1071,32 @@ func (s) TestUpdateAddresses_RetryFromFirstAddr(t *testing.T) {
 	}
 
 	// Grab the addrConn and call tryUpdateAddrs.
-	var ac *addrConn
 	client.mu.Lock()
 	for clientAC := range client.conns {
-		ac = clientAC
-		break
+		// Call UpdateAddresses with the same list of addresses, it should be a noop
+		// (even when the SubConn is Connecting, and doesn't have a curAddr).
+		clientAC.acbw.UpdateAddresses(clientAC.addrs)
 	}
 	client.mu.Unlock()
 
-	ac.acbw.UpdateAddresses(addrsList)
-
 	// We've called tryUpdateAddrs - now let's make server2 close the
-	// connection and check that it goes back to server1 instead of continuing
-	// to server3 or trying server2 again.
+	// connection and check that it continues to server3.
 	close(closeServer2)
 
 	select {
 	case <-server1ContactedSecondTime:
+		t.Fatal("server1 was contacted a second time, but it should have continued to server 3")
 	case <-server2ContactedSecondTime:
-		t.Fatal("server2 was contacted a second time, but it after tryUpdateAddrs it should have re-started the list and tried server1")
+		t.Fatal("server2 was contacted a second time, but it should have continued to server 3")
 	case <-server3Contacted:
-		t.Fatal("server3 was contacted, but after tryUpdateAddrs it should have re-started the list and tried server1")
 	case <-timeout:
 		t.Fatal("timed out waiting for any server to be contacted after tryUpdateAddrs")
 	}
 }
 
 func (s) TestDefaultServiceConfig(t *testing.T) {
-	r := manual.NewBuilderWithScheme("whatever")
-	addr := r.Scheme() + ":///non.existent"
-	js := `{
+	const defaultSC = `
+{
     "methodConfig": [
         {
             "name": [
@@ -1029,10 +1109,40 @@ func (s) TestDefaultServiceConfig(t *testing.T) {
         }
     ]
 }`
-	testInvalidDefaultServiceConfig(t)
-	testDefaultServiceConfigWhenResolverServiceConfigDisabled(t, r, addr, js)
-	testDefaultServiceConfigWhenResolverDoesNotReturnServiceConfig(t, r, addr, js)
-	testDefaultServiceConfigWhenResolverReturnInvalidServiceConfig(t, r, addr, js)
+	tests := []struct {
+		name  string
+		testF func(t *testing.T, r *manual.Resolver, addr, sc string)
+		sc    string
+	}{
+		{
+			name:  "invalid-service-config",
+			testF: testInvalidDefaultServiceConfig,
+			sc:    "",
+		},
+		{
+			name:  "resolver-service-config-disabled",
+			testF: testDefaultServiceConfigWhenResolverServiceConfigDisabled,
+			sc:    defaultSC,
+		},
+		{
+			name:  "resolver-does-not-return-service-config",
+			testF: testDefaultServiceConfigWhenResolverDoesNotReturnServiceConfig,
+			sc:    defaultSC,
+		},
+		{
+			name:  "resolver-returns-invalid-service-config",
+			testF: testDefaultServiceConfigWhenResolverReturnInvalidServiceConfig,
+			sc:    defaultSC,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := manual.NewBuilderWithScheme(test.name)
+			addr := r.Scheme() + ":///non.existent"
+			test.testF(t, r, addr, test.sc)
+		})
+	}
 }
 
 func verifyWaitForReadyEqualsTrue(cc *ClientConn) bool {
@@ -1047,8 +1157,8 @@ func verifyWaitForReadyEqualsTrue(cc *ClientConn) bool {
 	return i != 10
 }
 
-func testInvalidDefaultServiceConfig(t *testing.T) {
-	_, err := Dial("fake.com", WithTransportCredentials(insecure.NewCredentials()), WithDefaultServiceConfig(""))
+func testInvalidDefaultServiceConfig(t *testing.T, r *manual.Resolver, addr, sc string) {
+	_, err := Dial(addr, WithTransportCredentials(insecure.NewCredentials()), WithResolvers(r), WithDefaultServiceConfig(sc))
 	if !strings.Contains(err.Error(), invalidDefaultServiceConfigErrPrefix) {
 		t.Fatalf("Dial got err: %v, want err contains: %v", err, invalidDefaultServiceConfigErrPrefix)
 	}
@@ -1098,10 +1208,77 @@ func testDefaultServiceConfigWhenResolverReturnInvalidServiceConfig(t *testing.T
 	}
 }
 
+type stateRecordingBalancer struct {
+	balancer.Balancer
+}
+
+func (b *stateRecordingBalancer) UpdateSubConnState(sc balancer.SubConn, s balancer.SubConnState) {
+	panic(fmt.Sprintf("UpdateSubConnState(%v, %+v) called unexpectedly", sc, s))
+}
+
+func (b *stateRecordingBalancer) Close() {
+	b.Balancer.Close()
+}
+
+type stateRecordingBalancerBuilder struct {
+	mu       sync.Mutex
+	notifier chan connectivity.State // The notifier used in the last Balancer.
+}
+
+func newStateRecordingBalancerBuilder() *stateRecordingBalancerBuilder {
+	return &stateRecordingBalancerBuilder{}
+}
+
+func (b *stateRecordingBalancerBuilder) Name() string {
+	return stateRecordingBalancerName
+}
+
+func (b *stateRecordingBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+	stateNotifications := make(chan connectivity.State, 10)
+	b.mu.Lock()
+	b.notifier = stateNotifications
+	b.mu.Unlock()
+	return &stateRecordingBalancer{
+		Balancer: balancer.Get("pick_first").Build(&stateRecordingCCWrapper{cc, stateNotifications}, opts),
+	}
+}
+
+func (b *stateRecordingBalancerBuilder) nextStateNotifier() <-chan connectivity.State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ret := b.notifier
+	b.notifier = nil
+	return ret
+}
+
+type stateRecordingCCWrapper struct {
+	balancer.ClientConn
+	notifier chan<- connectivity.State
+}
+
+func (ccw *stateRecordingCCWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
+	oldListener := opts.StateListener
+	opts.StateListener = func(s balancer.SubConnState) {
+		ccw.notifier <- s.ConnectivityState
+		oldListener(s)
+	}
+	return ccw.ClientConn.NewSubConn(addrs, opts)
+}
+
+// Keep reading until something causes the connection to die (EOF, server
+// closed, etc). Useful as a tool for mindlessly keeping the connection
+// healthy, since the client will error if things like client prefaces are not
+// accepted in a timely fashion.
+func keepReading(conn net.Conn) {
+	buf := make([]byte, 1024)
+	for _, err := conn.Read(buf); err == nil; _, err = conn.Read(buf) {
+	}
+}
+
 // stayConnected makes cc stay connected by repeatedly calling cc.Connect()
 // until the state becomes Shutdown or until 10 seconds elapses.
 func stayConnected(cc *ClientConn) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
 	for {
@@ -1115,5 +1292,42 @@ func stayConnected(cc *ClientConn) {
 		if !cc.WaitForStateChange(ctx, state) {
 			return
 		}
+	}
+}
+
+func (s) TestURLAuthorityEscape(t *testing.T) {
+	tests := []struct {
+		name      string
+		authority string
+		want      string
+	}{
+		{
+			name:      "ipv6_authority",
+			authority: "[::1]",
+			want:      "[::1]",
+		},
+		{
+			name:      "with_user_and_host",
+			authority: "userinfo@host:10001",
+			want:      "userinfo@host:10001",
+		},
+		{
+			name:      "with_multiple_slashes",
+			authority: "projects/123/network/abc/service",
+			want:      "projects%2F123%2Fnetwork%2Fabc%2Fservice",
+		},
+		{
+			name:      "all_possible_allowed_chars",
+			authority: "abc123-._~!$&'()*+,;=@:[]",
+			want:      "abc123-._~!$&'()*+,;=@:[]",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got, want := encodeAuthority(test.authority), test.want; got != want {
+				t.Errorf("encodeAuthority(%s) = %s, want %s", test.authority, got, test.want)
+			}
+		})
 	}
 }

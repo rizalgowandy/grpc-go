@@ -44,14 +44,14 @@ type ecServer struct {
 	addr string
 }
 
-func (s *ecServer) UnaryEcho(ctx context.Context, req *pb.EchoRequest) (*pb.EchoResponse, error) {
+func (s *ecServer) UnaryEcho(_ context.Context, req *pb.EchoRequest) (*pb.EchoResponse, error) {
 	return &pb.EchoResponse{Message: fmt.Sprintf("%s (from %s)", req.Message, s.addr)}, nil
 }
 
 func main() {
 	flag.Parse()
 	netw := "unix"
-	socketAddr := fmt.Sprintf("\x00%v", *addr)
+	socketAddr := fmt.Sprintf("@%v", *addr)
 	lis, err := net.Listen(netw, socketAddr)
 	if err != nil {
 		log.Fatalf("net.Listen(%q, %q) failed: %v", netw, socketAddr, err)

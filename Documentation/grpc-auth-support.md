@@ -1,6 +1,6 @@
 # Authentication
 
-As outlined in the [gRPC authentication guide](https://grpc.io/docs/guides/auth.html) there are a number of different mechanisms for asserting identity between an client and server. We'll present some code-samples here demonstrating how to provide TLS support encryption and identity assertions as well as passing OAuth2 tokens to services that support it.
+As outlined in the [gRPC authentication guide](https://grpc.io/docs/guides/auth.html) there are a number of different mechanisms for asserting identity between a client and server. We'll present some code-samples here demonstrating how to provide TLS support encryption and identity assertions as well as passing OAuth2 tokens to services that support it.
 
 # Enabling TLS on a gRPC client
 
@@ -53,7 +53,7 @@ Alternatively, a client may also use the `grpc.CallOption`
 on each invocation of an RPC.
 
 To create a `credentials.PerRPCCredentials`, use
-[oauth.NewOauthAccess](https://godoc.org/google.golang.org/grpc/credentials/oauth#NewOauthAccess).
+[oauth.TokenSource](https://godoc.org/google.golang.org/grpc/credentials/oauth#TokenSource).
 Note, the OAuth2 implementation of `grpc.PerRPCCredentials` requires a client to use
 [grpc.WithTransportCredentials](https://godoc.org/google.golang.org/grpc#WithTransportCredentials)
 to prevent any insecure transmission of tokens.

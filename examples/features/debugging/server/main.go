@@ -16,18 +16,19 @@
  *
  */
 
-// Binary server is an example server.
+// Binary server demonstrates how to enable logging and Channelz for debugging
+// gRPC services.
 package main
 
 import (
 	"context"
 	"log"
+	rand "math/rand/v2"
 	"net"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/channelz/service"
-	"google.golang.org/grpc/internal/grpcrand"
 
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 )
@@ -42,7 +43,7 @@ type server struct {
 }
 
 // SayHello implements helloworld.GreeterServer
-func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+func (s *server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
 	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
 }
 
@@ -52,15 +53,15 @@ type slowServer struct {
 }
 
 // SayHello implements helloworld.GreeterServer
-func (s *slowServer) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+func (s *slowServer) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
 	// Delay 100ms ~ 200ms before replying
-	time.Sleep(time.Duration(100+grpcrand.Intn(100)) * time.Millisecond)
+	time.Sleep(time.Duration(100+rand.IntN(100)) * time.Millisecond)
 	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
 }
 
 func main() {
 	/***** Set up the server serving channelz service. *****/
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", ":50052")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}

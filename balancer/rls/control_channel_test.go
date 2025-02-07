@@ -24,19 +24,19 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"strings"
+	"os"
+	"regexp"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
-	"google.golang.org/grpc/balancer/rls/internal/test/e2e"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal"
 	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
+	rlstest "google.golang.org/grpc/internal/testutils/rls"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/testdata"
@@ -47,7 +47,7 @@ import (
 // indicates that the control channel needs to be throttled.
 func (s) TestControlChannelThrottled(t *testing.T) {
 	// Start an RLS server and set the throttler to always throttle requests.
-	rlsServer, rlsReqCh := setupFakeRLSServer(t, nil)
+	rlsServer, rlsReqCh := rlstest.SetupFakeRLSServer(t, nil)
 	overrideAdaptiveThrottler(t, alwaysThrottlingThrottler())
 
 	// Create a control channel to the fake RLS server.
@@ -62,7 +62,7 @@ func (s) TestControlChannelThrottled(t *testing.T) {
 
 	select {
 	case <-rlsReqCh:
-		t.Fatal("RouteLookup RPC invoked when control channel is throtlled")
+		t.Fatal("RouteLookup RPC invoked when control channel is throttled")
 	case <-time.After(defaultTestShortTimeout):
 	}
 }
@@ -70,12 +70,12 @@ func (s) TestControlChannelThrottled(t *testing.T) {
 // TestLookupFailure tests the case where the RLS server responds with an error.
 func (s) TestLookupFailure(t *testing.T) {
 	// Start an RLS server and set the throttler to never throttle requests.
-	rlsServer, _ := setupFakeRLSServer(t, nil)
+	rlsServer, _ := rlstest.SetupFakeRLSServer(t, nil)
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Setup the RLS server to respond with errors.
-	rlsServer.SetResponseCallback(func(_ context.Context, req *rlspb.RouteLookupRequest) *e2e.RouteLookupResponse {
-		return &e2e.RouteLookupResponse{Err: errors.New("rls failure")}
+	rlsServer.SetResponseCallback(func(context.Context, *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
+		return &rlstest.RouteLookupResponse{Err: errors.New("rls failure")}
 	})
 
 	// Create a control channel to the fake RLS server.
@@ -109,12 +109,12 @@ func (s) TestLookupFailure(t *testing.T) {
 // respond within the configured rpc timeout.
 func (s) TestLookupDeadlineExceeded(t *testing.T) {
 	// A unary interceptor which returns a status error with DeadlineExceeded.
-	interceptor := func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	interceptor := func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (resp any, err error) {
 		return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
 	}
 
 	// Start an RLS server and set the throttler to never throttle.
-	rlsServer, _ := setupFakeRLSServer(t, nil, grpc.UnaryInterceptor(interceptor))
+	rlsServer, _ := rlstest.SetupFakeRLSServer(t, nil, grpc.UnaryInterceptor(interceptor))
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Create a control channel with a small deadline.
@@ -191,7 +191,7 @@ func (f *testPerRPCCredentials) RequireTransportSecurity() bool {
 
 // Unary server interceptor which validates if the RPC contains call credentials
 // which match `perRPCCredsData
-func callCredsValidatingServerInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+func callCredsValidatingServerInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.PermissionDenied, "didn't find metadata in context")
@@ -215,9 +215,9 @@ func makeTLSCreds(t *testing.T, certPath, keyPath, rootsPath string) credentials
 	if err != nil {
 		t.Fatalf("tls.LoadX509KeyPair(%q, %q) failed: %v", certPath, keyPath, err)
 	}
-	b, err := ioutil.ReadFile(testdata.Path(rootsPath))
+	b, err := os.ReadFile(testdata.Path(rootsPath))
 	if err != nil {
-		t.Fatalf("ioutil.ReadFile(%q) failed: %v", rootsPath, err)
+		t.Fatalf("os.ReadFile(%q) failed: %v", rootsPath, err)
 	}
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(b) {
@@ -246,7 +246,7 @@ var (
 		Reason:          rlspb.RouteLookupRequest_REASON_MISS,
 		StaleHeaderData: staleHeaderData,
 	}
-	lookupResponse = &e2e.RouteLookupResponse{
+	lookupResponse = &rlstest.RouteLookupResponse{
 		Resp: &rlspb.RouteLookupResponse{
 			Targets:    wantTargets,
 			HeaderData: wantHeaderData,
@@ -256,11 +256,11 @@ var (
 
 func testControlChannelCredsSuccess(t *testing.T, sopts []grpc.ServerOption, bopts balancer.BuildOptions) {
 	// Start an RLS server and set the throttler to never throttle requests.
-	rlsServer, _ := setupFakeRLSServer(t, nil, sopts...)
+	rlsServer, _ := rlstest.SetupFakeRLSServer(t, nil, sopts...)
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Setup the RLS server to respond with a valid response.
-	rlsServer.SetResponseCallback(func(_ context.Context, req *rlspb.RouteLookupRequest) *e2e.RouteLookupResponse {
+	rlsServer.SetResponseCallback(func(context.Context, *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
 		return lookupResponse
 	})
 
@@ -350,13 +350,13 @@ func (s) TestControlChannelCredsSuccess(t *testing.T) {
 	}
 }
 
-func testControlChannelCredsFailure(t *testing.T, sopts []grpc.ServerOption, bopts balancer.BuildOptions, wantCode codes.Code, wantErr string) {
+func testControlChannelCredsFailure(t *testing.T, sopts []grpc.ServerOption, bopts balancer.BuildOptions, wantCode codes.Code, wantErrRegex *regexp.Regexp) {
 	// StartFakeRouteLookupServer a fake server.
 	//
 	// Start an RLS server and set the throttler to never throttle requests. The
 	// creds failures happen before the RPC handler on the server is invoked.
 	// So, there is need to setup the request and responses on the fake server.
-	rlsServer, _ := setupFakeRLSServer(t, nil, sopts...)
+	rlsServer, _ := rlstest.SetupFakeRLSServer(t, nil, sopts...)
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Create the control channel to the fake server.
@@ -369,8 +369,8 @@ func testControlChannelCredsFailure(t *testing.T, sopts []grpc.ServerOption, bop
 	// Perform the lookup and expect the callback to be invoked with an error.
 	errCh := make(chan error)
 	ctrlCh.lookup(nil, rlspb.RouteLookupRequest_REASON_MISS, staleHeaderData, func(_ []string, _ string, err error) {
-		if st, ok := status.FromError(err); !ok || st.Code() != wantCode || !strings.Contains(st.String(), wantErr) {
-			errCh <- fmt.Errorf("rlsClient.lookup() returned error: %v, wantCode: %v, wantErr: %s", err, wantCode, wantErr)
+		if st, ok := status.FromError(err); !ok || st.Code() != wantCode || !wantErrRegex.MatchString(st.String()) {
+			errCh <- fmt.Errorf("rlsClient.lookup() returned error: %v, wantCode: %v, wantErr: %s", err, wantCode, wantErrRegex.String())
 			return
 		}
 		errCh <- nil
@@ -393,11 +393,11 @@ func (s) TestControlChannelCredsFailure(t *testing.T) {
 	clientCreds := makeTLSCreds(t, "x509/client1_cert.pem", "x509/client1_key.pem", "x509/server_ca_cert.pem")
 
 	tests := []struct {
-		name     string
-		sopts    []grpc.ServerOption
-		bopts    balancer.BuildOptions
-		wantCode codes.Code
-		wantErr  string
+		name         string
+		sopts        []grpc.ServerOption
+		bopts        balancer.BuildOptions
+		wantCode     codes.Code
+		wantErrRegex *regexp.Regexp
 	}{
 		{
 			name:  "transport creds authority mismatch",
@@ -406,8 +406,8 @@ func (s) TestControlChannelCredsFailure(t *testing.T) {
 				DialCreds: clientCreds,
 				Authority: "authority-mismatch",
 			},
-			wantCode: codes.Unavailable,
-			wantErr:  "transport: authentication handshake failed: x509: certificate is valid for *.test.example.com, not authority-mismatch",
+			wantCode:     codes.Unavailable,
+			wantErrRegex: regexp.MustCompile(`transport: authentication handshake failed: .* \*\.test\.example\.com.*authority-mismatch`),
 		},
 		{
 			name:  "transport creds handshake failure",
@@ -416,8 +416,8 @@ func (s) TestControlChannelCredsFailure(t *testing.T) {
 				DialCreds: clientCreds,
 				Authority: "x.test.example.com",
 			},
-			wantCode: codes.Unavailable,
-			wantErr:  "transport: authentication handshake failed: tls: first record does not look like a TLS handshake",
+			wantCode:     codes.Unavailable,
+			wantErrRegex: regexp.MustCompile("transport: authentication handshake failed: .*"),
 		},
 		{
 			name: "call creds mismatch",
@@ -432,13 +432,13 @@ func (s) TestControlChannelCredsFailure(t *testing.T) {
 				},
 				Authority: "x.test.example.com",
 			},
-			wantCode: codes.PermissionDenied,
-			wantErr:  "didn't find call creds",
+			wantCode:     codes.PermissionDenied,
+			wantErrRegex: regexp.MustCompile("didn't find call creds"),
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testControlChannelCredsFailure(t, test.sopts, test.bopts, test.wantCode, test.wantErr)
+			testControlChannelCredsFailure(t, test.sopts, test.bopts, test.wantCode, test.wantErrRegex)
 		})
 	}
 }
@@ -454,7 +454,7 @@ func (*unsupportedCredsBundle) NewWithMode(mode string) (credentials.Bundle, err
 // TestNewControlChannelUnsupportedCredsBundle tests the case where the control
 // channel is configured with a bundle which does not support the mode we use.
 func (s) TestNewControlChannelUnsupportedCredsBundle(t *testing.T) {
-	rlsServer, _ := setupFakeRLSServer(t, nil)
+	rlsServer, _ := rlstest.SetupFakeRLSServer(t, nil)
 
 	// Create the control channel to the fake server.
 	ctrlCh, err := newControlChannel(rlsServer.Address, "", defaultTestTimeout, balancer.BuildOptions{CredsBundle: &unsupportedCredsBundle{}}, nil)

@@ -24,6 +24,7 @@ package weightedtarget
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/weightedtarget/weightedaggregator"
@@ -54,7 +55,13 @@ func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Ba
 	b.logger = prefixLogger(b)
 	b.stateAggregator = weightedaggregator.New(cc, b.logger, NewRandomWRR)
 	b.stateAggregator.Start()
-	b.bg = balancergroup.New(cc, bOpts, b.stateAggregator, b.logger)
+	b.bg = balancergroup.New(balancergroup.Options{
+		CC:                      cc,
+		BuildOpts:               bOpts,
+		StateAggregator:         b.stateAggregator,
+		Logger:                  b.logger,
+		SubBalancerCloseTimeout: time.Duration(0), // Disable caching of removed child policies
+	})
 	b.bg.Start()
 	b.logger.Infof("Created")
 	return b
@@ -77,27 +84,40 @@ type weightedTargetBalancer struct {
 	targets map[string]Target
 }
 
+type localityKeyType string
+
+const localityKey = localityKeyType("locality")
+
+// LocalityFromResolverState returns the locality from the resolver.State
+// provided, or an empty string if not present.
+func LocalityFromResolverState(state resolver.State) string {
+	locality, _ := state.Attributes.Value(localityKey).(string)
+	return locality
+}
+
 // UpdateClientConnState takes the new targets in balancer group,
 // creates/deletes sub-balancers and sends them update. addresses are split into
 // groups based on hierarchy path.
 func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	if b.logger.V(2) {
+		b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	}
+
 	newConfig, ok := s.BalancerConfig.(*LBConfig)
 	if !ok {
 		return fmt.Errorf("unexpected balancer config with type: %T", s.BalancerConfig)
 	}
 	addressesSplit := hierarchy.Group(s.ResolverState.Addresses)
+	endpointsSplit := hierarchy.GroupEndpoints(s.ResolverState.Endpoints)
 
-	var rebuildStateAndPicker bool
+	b.stateAggregator.PauseStateUpdates()
+	defer b.stateAggregator.ResumeStateUpdates()
 
 	// Remove sub-pickers and sub-balancers that are not in the new config.
 	for name := range b.targets {
 		if _, ok := newConfig.Targets[name]; !ok {
 			b.stateAggregator.Remove(name)
 			b.bg.Remove(name)
-			// Trigger a state/picker update, because we don't want `ClientConn`
-			// to pick this sub-balancer anymore.
-			rebuildStateAndPicker = true
 		}
 	}
 
@@ -116,21 +136,15 @@ func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnStat
 			// Not trigger a state/picker update. Wait for the new sub-balancer
 			// to send its updates.
 		} else if newT.ChildPolicy.Name != oldT.ChildPolicy.Name {
-			// If the child policy name is differet, remove from balancer group
+			// If the child policy name is different, remove from balancer group
 			// and re-add.
 			b.stateAggregator.Remove(name)
 			b.bg.Remove(name)
 			b.stateAggregator.Add(name, newT.Weight)
 			b.bg.Add(name, balancer.Get(newT.ChildPolicy.Name))
-			// Trigger a state/picker update, because we don't want `ClientConn`
-			// to pick this sub-balancer anymore.
-			rebuildStateAndPicker = true
 		} else if newT.Weight != oldT.Weight {
 			// If this is an existing sub-balancer, update weight if necessary.
 			b.stateAggregator.UpdateWeight(name, newT.Weight)
-			// Trigger a state/picker update, because we don't want `ClientConn`
-			// should do picks with the new weights now.
-			rebuildStateAndPicker = true
 		}
 
 		// Forwards all the update:
@@ -142,8 +156,9 @@ func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnStat
 		_ = b.bg.UpdateClientConnState(name, balancer.ClientConnState{
 			ResolverState: resolver.State{
 				Addresses:     addressesSplit[name],
+				Endpoints:     endpointsSplit[name],
 				ServiceConfig: s.ResolverState.ServiceConfig,
-				Attributes:    s.ResolverState.Attributes,
+				Attributes:    s.ResolverState.Attributes.WithValue(localityKey, name),
 			},
 			BalancerConfig: newT.ChildPolicy.Config,
 		})
@@ -151,9 +166,18 @@ func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnStat
 
 	b.targets = newConfig.Targets
 
-	if rebuildStateAndPicker {
-		b.stateAggregator.BuildAndUpdate()
+	// If the targets length is zero, it means we have removed all child
+	// policies from the balancer group and aggregator.
+	// At the start of this UpdateClientConnState() operation, a call to
+	// b.stateAggregator.ResumeStateUpdates() is deferred. Thus, setting the
+	// needUpdateStateOnResume bool to true here will ensure a new picker is
+	// built as part of that deferred function. Since there are now no child
+	// policies, the aggregated connectivity state reported form the Aggregator
+	// will be TRANSIENT_FAILURE.
+	if len(b.targets) == 0 {
+		b.stateAggregator.NeedUpdateStateOnResume()
 	}
+
 	return nil
 }
 
@@ -162,7 +186,7 @@ func (b *weightedTargetBalancer) ResolverError(err error) {
 }
 
 func (b *weightedTargetBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
-	b.bg.UpdateSubConnState(sc, state)
+	b.logger.Errorf("UpdateSubConnState(%v, %+v) called unexpectedly", sc, state)
 }
 
 func (b *weightedTargetBalancer) Close() {

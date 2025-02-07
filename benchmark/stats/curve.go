@@ -23,9 +23,8 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"math"
-	"math/rand"
+	rand "math/rand/v2"
 	"os"
 	"sort"
 	"strconv"
@@ -75,13 +74,13 @@ func (pcr *payloadCurveRange) chooseRandom() int {
 		return int(pcr.from)
 	}
 
-	return int(rand.Int31n(pcr.to-pcr.from+1) + pcr.from)
+	return int(rand.Int32N(pcr.to-pcr.from+1) + pcr.from)
 }
 
 // sha256file is a helper function that returns a hex string matching the
 // SHA-256 sum of the input file.
 func sha256file(file string) (string, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return "", err
 	}

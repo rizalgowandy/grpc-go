@@ -20,21 +20,24 @@ package binarylog
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	dpb "github.com/golang/protobuf/ptypes/duration"
-	pb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
+	binlogpb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+const defaultTestTimeout = 10 * time.Second
 
 func (s) TestLog(t *testing.T) {
 	idGen.reset()
-	ml := newMethodLogger(10, 10)
+	ml := NewTruncatingMethodLogger(10, 10)
 	// Set sink to testing buffer.
 	buf := bytes.NewBuffer(nil)
 	ml.sink = newWriterSink(buf)
@@ -46,7 +49,7 @@ func (s) TestLog(t *testing.T) {
 	port6 := 796
 	tcpAddr6, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("[%v]:%d", addr6, port6))
 
-	testProtoMsg := &pb.Message{
+	testProtoMsg := &binlogpb.Message{
 		Length: 1,
 		Data:   []byte{'a'},
 	}
@@ -54,7 +57,7 @@ func (s) TestLog(t *testing.T) {
 
 	testCases := []struct {
 		config LogEntryConfig
-		want   *pb.GrpcLogEntry
+		want   *binlogpb.GrpcLogEntry
 	}{
 		{
 			config: &ClientHeader{
@@ -67,31 +70,31 @@ func (s) TestLog(t *testing.T) {
 				Timeout:    2*time.Second + 3*time.Nanosecond,
 				PeerAddr:   tcpAddr,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
-				Logger:               pb.GrpcLogEntry_LOGGER_SERVER,
-				Payload: &pb.GrpcLogEntry_ClientHeader{
-					ClientHeader: &pb.ClientHeader{
-						Metadata: &pb.Metadata{
-							Entry: []*pb.MetadataEntry{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_SERVER,
+				Payload: &binlogpb.GrpcLogEntry_ClientHeader{
+					ClientHeader: &binlogpb.ClientHeader{
+						Metadata: &binlogpb.Metadata{
+							Entry: []*binlogpb.MetadataEntry{
 								{Key: "a", Value: []byte{'b'}},
 								{Key: "a", Value: []byte{'b', 'b'}},
 							},
 						},
 						MethodName: "testservice/testmethod",
 						Authority:  "test.service.io",
-						Timeout: &dpb.Duration{
+						Timeout: &durationpb.Duration{
 							Seconds: 2,
 							Nanos:   3,
 						},
 					},
 				},
 				PayloadTruncated: false,
-				Peer: &pb.Address{
-					Type:    pb.Address_TYPE_IPV4,
+				Peer: &binlogpb.Address{
+					Type:    binlogpb.Address_TYPE_IPV4,
 					Address: addr,
 					IpPort:  uint32(port),
 				},
@@ -103,15 +106,15 @@ func (s) TestLog(t *testing.T) {
 				MethodName:   "testservice/testmethod",
 				Authority:    "test.service.io",
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
-				Logger:               pb.GrpcLogEntry_LOGGER_SERVER,
-				Payload: &pb.GrpcLogEntry_ClientHeader{
-					ClientHeader: &pb.ClientHeader{
-						Metadata:   &pb.Metadata{},
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_SERVER,
+				Payload: &binlogpb.GrpcLogEntry_ClientHeader{
+					ClientHeader: &binlogpb.ClientHeader{
+						Metadata:   &binlogpb.Metadata{},
 						MethodName: "testservice/testmethod",
 						Authority:  "test.service.io",
 					},
@@ -127,16 +130,16 @@ func (s) TestLog(t *testing.T) {
 				},
 				PeerAddr: tcpAddr6,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_SERVER_HEADER,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
-				Payload: &pb.GrpcLogEntry_ServerHeader{
-					ServerHeader: &pb.ServerHeader{
-						Metadata: &pb.Metadata{
-							Entry: []*pb.MetadataEntry{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_SERVER_HEADER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
+				Payload: &binlogpb.GrpcLogEntry_ServerHeader{
+					ServerHeader: &binlogpb.ServerHeader{
+						Metadata: &binlogpb.Metadata{
+							Entry: []*binlogpb.MetadataEntry{
 								{Key: "a", Value: []byte{'b'}},
 								{Key: "a", Value: []byte{'b', 'b'}},
 							},
@@ -144,8 +147,8 @@ func (s) TestLog(t *testing.T) {
 					},
 				},
 				PayloadTruncated: false,
-				Peer: &pb.Address{
-					Type:    pb.Address_TYPE_IPV6,
+				Peer: &binlogpb.Address{
+					Type:    binlogpb.Address_TYPE_IPV6,
 					Address: addr6,
 					IpPort:  uint32(port6),
 				},
@@ -156,14 +159,14 @@ func (s) TestLog(t *testing.T) {
 				OnClientSide: true,
 				Message:      testProtoMsg,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CLIENT_MESSAGE,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
-				Payload: &pb.GrpcLogEntry_Message{
-					Message: &pb.Message{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CLIENT_MESSAGE,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
+				Payload: &binlogpb.GrpcLogEntry_Message{
+					Message: &binlogpb.Message{
 						Length: uint32(len(testProtoBytes)),
 						Data:   testProtoBytes,
 					},
@@ -177,14 +180,14 @@ func (s) TestLog(t *testing.T) {
 				OnClientSide: false,
 				Message:      testProtoMsg,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_SERVER_MESSAGE,
-				Logger:               pb.GrpcLogEntry_LOGGER_SERVER,
-				Payload: &pb.GrpcLogEntry_Message{
-					Message: &pb.Message{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_SERVER_MESSAGE,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_SERVER,
+				Payload: &binlogpb.GrpcLogEntry_Message{
+					Message: &binlogpb.Message{
 						Length: uint32(len(testProtoBytes)),
 						Data:   testProtoBytes,
 					},
@@ -197,12 +200,12 @@ func (s) TestLog(t *testing.T) {
 			config: &ClientHalfClose{
 				OnClientSide: false,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CLIENT_HALF_CLOSE,
-				Logger:               pb.GrpcLogEntry_LOGGER_SERVER,
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CLIENT_HALF_CLOSE,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_SERVER,
 				Payload:              nil,
 				PayloadTruncated:     false,
 				Peer:                 nil,
@@ -214,23 +217,23 @@ func (s) TestLog(t *testing.T) {
 				Err:          status.Errorf(codes.Unavailable, "test"),
 				PeerAddr:     tcpAddr,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_SERVER_TRAILER,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
-				Payload: &pb.GrpcLogEntry_Trailer{
-					Trailer: &pb.Trailer{
-						Metadata:      &pb.Metadata{},
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_SERVER_TRAILER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
+				Payload: &binlogpb.GrpcLogEntry_Trailer{
+					Trailer: &binlogpb.Trailer{
+						Metadata:      &binlogpb.Metadata{},
 						StatusCode:    uint32(codes.Unavailable),
 						StatusMessage: "test",
 						StatusDetails: nil,
 					},
 				},
 				PayloadTruncated: false,
-				Peer: &pb.Address{
-					Type:    pb.Address_TYPE_IPV4,
+				Peer: &binlogpb.Address{
+					Type:    binlogpb.Address_TYPE_IPV4,
 					Address: addr,
 					IpPort:  uint32(port),
 				},
@@ -240,15 +243,15 @@ func (s) TestLog(t *testing.T) {
 			config: &ServerTrailer{
 				OnClientSide: true,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_SERVER_TRAILER,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
-				Payload: &pb.GrpcLogEntry_Trailer{
-					Trailer: &pb.Trailer{
-						Metadata:      &pb.Metadata{},
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_SERVER_TRAILER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
+				Payload: &binlogpb.GrpcLogEntry_Trailer{
+					Trailer: &binlogpb.Trailer{
+						Metadata:      &binlogpb.Metadata{},
 						StatusCode:    uint32(codes.OK),
 						StatusMessage: "",
 						StatusDetails: nil,
@@ -262,12 +265,12 @@ func (s) TestLog(t *testing.T) {
 			config: &Cancel{
 				OnClientSide: true,
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CANCEL,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CANCEL,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
 				Payload:              nil,
 				PayloadTruncated:     false,
 				Peer:                 nil,
@@ -284,16 +287,16 @@ func (s) TestLog(t *testing.T) {
 					"a":             {"b", "bb"},
 				},
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
-				Logger:               pb.GrpcLogEntry_LOGGER_SERVER,
-				Payload: &pb.GrpcLogEntry_ClientHeader{
-					ClientHeader: &pb.ClientHeader{
-						Metadata: &pb.Metadata{
-							Entry: []*pb.MetadataEntry{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_CLIENT_HEADER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_SERVER,
+				Payload: &binlogpb.GrpcLogEntry_ClientHeader{
+					ClientHeader: &binlogpb.ClientHeader{
+						Metadata: &binlogpb.Metadata{
+							Entry: []*binlogpb.MetadataEntry{
 								{Key: "a", Value: []byte{'b'}},
 								{Key: "a", Value: []byte{'b', 'b'}},
 							},
@@ -312,16 +315,16 @@ func (s) TestLog(t *testing.T) {
 					"a":             {"b", "bb"},
 				},
 			},
-			want: &pb.GrpcLogEntry{
+			want: &binlogpb.GrpcLogEntry{
 				Timestamp:            nil,
 				CallId:               1,
 				SequenceIdWithinCall: 0,
-				Type:                 pb.GrpcLogEntry_EVENT_TYPE_SERVER_HEADER,
-				Logger:               pb.GrpcLogEntry_LOGGER_CLIENT,
-				Payload: &pb.GrpcLogEntry_ServerHeader{
-					ServerHeader: &pb.ServerHeader{
-						Metadata: &pb.Metadata{
-							Entry: []*pb.MetadataEntry{
+				Type:                 binlogpb.GrpcLogEntry_EVENT_TYPE_SERVER_HEADER,
+				Logger:               binlogpb.GrpcLogEntry_LOGGER_CLIENT,
+				Payload: &binlogpb.GrpcLogEntry_ServerHeader{
+					ServerHeader: &binlogpb.ServerHeader{
+						Metadata: &binlogpb.Metadata{
+							Entry: []*binlogpb.MetadataEntry{
 								{Key: "a", Value: []byte{'b'}},
 								{Key: "a", Value: []byte{'b', 'b'}},
 							},
@@ -332,11 +335,13 @@ func (s) TestLog(t *testing.T) {
 			},
 		},
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	for i, tc := range testCases {
 		buf.Reset()
 		tc.want.SequenceIdWithinCall = uint64(i + 1)
-		ml.Log(tc.config)
-		inSink := new(pb.GrpcLogEntry)
+		ml.Log(ctx, tc.config)
+		inSink := new(binlogpb.GrpcLogEntry)
 		if err := proto.Unmarshal(buf.Bytes()[4:], inSink); err != nil {
 			t.Errorf("failed to unmarshal bytes in sink to proto: %v", err)
 			continue
@@ -350,45 +355,45 @@ func (s) TestLog(t *testing.T) {
 
 func (s) TestTruncateMetadataNotTruncated(t *testing.T) {
 	testCases := []struct {
-		ml   *methodLogger
-		mpPb *pb.Metadata
+		ml   *TruncatingMethodLogger
+		mpPb *binlogpb.Metadata
 	}{
 		{
-			ml: newMethodLogger(maxUInt, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(maxUInt, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 				},
 			},
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 				},
 			},
 		},
 		{
-			ml: newMethodLogger(1, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(1, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: nil},
 				},
 			},
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1, 1}},
 				},
 			},
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 					{Key: "", Value: []byte{1}},
 				},
@@ -397,9 +402,9 @@ func (s) TestTruncateMetadataNotTruncated(t *testing.T) {
 		// "grpc-trace-bin" is kept in log but not counted towards the size
 		// limit.
 		{
-			ml: newMethodLogger(1, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(1, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 					{Key: "grpc-trace-bin", Value: []byte("some.trace.key")},
 				},
@@ -417,24 +422,24 @@ func (s) TestTruncateMetadataNotTruncated(t *testing.T) {
 
 func (s) TestTruncateMetadataTruncated(t *testing.T) {
 	testCases := []struct {
-		ml   *methodLogger
-		mpPb *pb.Metadata
+		ml   *TruncatingMethodLogger
+		mpPb *binlogpb.Metadata
 
 		entryLen int
 	}{
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1, 1, 1}},
 				},
 			},
 			entryLen: 0,
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 					{Key: "", Value: []byte{1}},
 					{Key: "", Value: []byte{1}},
@@ -443,9 +448,9 @@ func (s) TestTruncateMetadataTruncated(t *testing.T) {
 			entryLen: 2,
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1, 1}},
 					{Key: "", Value: []byte{1}},
 				},
@@ -453,9 +458,9 @@ func (s) TestTruncateMetadataTruncated(t *testing.T) {
 			entryLen: 1,
 		},
 		{
-			ml: newMethodLogger(2, maxUInt),
-			mpPb: &pb.Metadata{
-				Entry: []*pb.MetadataEntry{
+			ml: NewTruncatingMethodLogger(2, maxUInt),
+			mpPb: &binlogpb.Metadata{
+				Entry: []*binlogpb.MetadataEntry{
 					{Key: "", Value: []byte{1}},
 					{Key: "", Value: []byte{1, 1}},
 				},
@@ -478,24 +483,24 @@ func (s) TestTruncateMetadataTruncated(t *testing.T) {
 
 func (s) TestTruncateMessageNotTruncated(t *testing.T) {
 	testCases := []struct {
-		ml    *methodLogger
-		msgPb *pb.Message
+		ml    *TruncatingMethodLogger
+		msgPb *binlogpb.Message
 	}{
 		{
-			ml: newMethodLogger(maxUInt, maxUInt),
-			msgPb: &pb.Message{
+			ml: NewTruncatingMethodLogger(maxUInt, maxUInt),
+			msgPb: &binlogpb.Message{
 				Data: []byte{1},
 			},
 		},
 		{
-			ml: newMethodLogger(maxUInt, 3),
-			msgPb: &pb.Message{
+			ml: NewTruncatingMethodLogger(maxUInt, 3),
+			msgPb: &binlogpb.Message{
 				Data: []byte{1, 1},
 			},
 		},
 		{
-			ml: newMethodLogger(maxUInt, 2),
-			msgPb: &pb.Message{
+			ml: NewTruncatingMethodLogger(maxUInt, 2),
+			msgPb: &binlogpb.Message{
 				Data: []byte{1, 1},
 			},
 		},
@@ -511,14 +516,14 @@ func (s) TestTruncateMessageNotTruncated(t *testing.T) {
 
 func (s) TestTruncateMessageTruncated(t *testing.T) {
 	testCases := []struct {
-		ml    *methodLogger
-		msgPb *pb.Message
+		ml    *TruncatingMethodLogger
+		msgPb *binlogpb.Message
 
 		oldLength uint32
 	}{
 		{
-			ml: newMethodLogger(maxUInt, 2),
-			msgPb: &pb.Message{
+			ml: NewTruncatingMethodLogger(maxUInt, 2),
+			msgPb: &binlogpb.Message{
 				Length: 3,
 				Data:   []byte{1, 1, 1},
 			},

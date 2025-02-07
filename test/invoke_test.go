@@ -27,8 +27,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/stubserver"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/status"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
 // TestInvoke verifies a straightforward invocation of ClientConn.Invoke().
@@ -122,7 +122,7 @@ func (s) TestInvokeCancel(t *testing.T) {
 	defer ss.Stop()
 
 	for i := 0; i < 100; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 		cancel()
 		ss.CC.Invoke(ctx, "/grpc.testing.TestService/EmptyCall", &testpb.Empty{}, &testpb.Empty{})
 	}
@@ -144,7 +144,7 @@ func (s) TestInvokeCancelClosedNonFailFast(t *testing.T) {
 	defer ss.Stop()
 
 	ss.CC.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	cancel()
 	if err := ss.CC.Invoke(ctx, "/grpc.testing.TestService/EmptyCall", &testpb.Empty{}, &testpb.Empty{}, grpc.WaitForReady(true)); err == nil {
 		t.Fatal("ClientConn.Invoke() on closed connection succeeded when expected to fail")

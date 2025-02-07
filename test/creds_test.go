@@ -32,13 +32,16 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 	"google.golang.org/grpc/testdata"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 const (
@@ -68,7 +71,7 @@ func (c *testCredsBundle) PerRPCCredentials() credentials.PerRPCCredentials {
 	if c.mode == bundleTLSOnly {
 		return nil
 	}
-	return testPerRPCCredentials{}
+	return testPerRPCCredentials{authdata: authdata}
 }
 
 func (c *testCredsBundle) NewWithMode(mode string) (credentials.Bundle, error) {
@@ -92,7 +95,7 @@ func (s) TestCredsBundleBoth(t *testing.T) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
@@ -116,7 +119,7 @@ func (s) TestCredsBundleTransportCredentials(t *testing.T) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
@@ -134,7 +137,7 @@ func (s) TestCredsBundlePerRPCCredentials(t *testing.T) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
@@ -147,7 +150,7 @@ type clientTimeoutCreds struct {
 	timeoutReturned bool
 }
 
-func (c *clientTimeoutCreds) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c *clientTimeoutCreds) ClientHandshake(_ context.Context, _ string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	if !c.timeoutReturned {
 		c.timeoutReturned = true
 		return nil, nil, context.DeadlineExceeded
@@ -170,7 +173,7 @@ func (s) TestNonFailFastRPCSucceedOnTimeoutCreds(t *testing.T) {
 	defer te.tearDown()
 
 	cc := te.clientConn(grpc.WithTransportCredentials(&clientTimeoutCreds{}))
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	// This unary call should succeed, because ClientHandshake will succeed for the second time.
@@ -181,9 +184,9 @@ func (s) TestNonFailFastRPCSucceedOnTimeoutCreds(t *testing.T) {
 
 type methodTestCreds struct{}
 
-func (m *methodTestCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+func (m *methodTestCreds) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
 	ri, _ := credentials.RequestInfoFromContext(ctx)
-	return nil, status.Errorf(codes.Unknown, ri.Method)
+	return nil, status.Error(codes.Unknown, ri.Method)
 }
 
 func (m *methodTestCreds) RequireTransportSecurity() bool { return false }
@@ -196,9 +199,9 @@ func (s) TestGRPCMethodAccessibleToCredsViaContextRequestInfo(t *testing.T) {
 	defer te.tearDown()
 
 	cc := te.clientConn(grpc.WithPerRPCCredentials(&methodTestCreds{}))
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); status.Convert(err).Message() != wantMethod {
 		t.Fatalf("ss.client.EmptyCall(_, _) = _, %v; want _, _.Message()=%q", err, wantMethod)
@@ -215,7 +218,7 @@ type clientAlwaysFailCred struct {
 	credentials.TransportCredentials
 }
 
-func (c clientAlwaysFailCred) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c clientAlwaysFailCred) ClientHandshake(context.Context, string, net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	return nil, nil, errors.New(clientAlwaysFailCredErrorMsg)
 }
 func (c clientAlwaysFailCred) Info() credentials.ProtocolInfo {
@@ -231,24 +234,17 @@ func (s) TestFailFastRPCErrorOnBadCertificates(t *testing.T) {
 	defer te.tearDown()
 
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(clientAlwaysFailCred{})}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	cc, err := grpc.DialContext(ctx, te.srvAddr, opts...)
+	cc, err := grpc.NewClient(te.srvAddr, opts...)
 	if err != nil {
-		t.Fatalf("Dial(_) = %v, want %v", err, nil)
+		t.Fatalf("NewClient(_) = %v, want %v", err, nil)
 	}
 	defer cc.Close()
 
-	tc := testpb.NewTestServiceClient(cc)
-	for i := 0; i < 1000; i++ {
-		// This loop runs for at most 1 second. The first several RPCs will fail
-		// with Unavailable because the connection hasn't started. When the
-		// first connection failed with creds error, the next RPC should also
-		// fail with the expected error.
-		if _, err = tc.EmptyCall(ctx, &testpb.Empty{}); strings.Contains(err.Error(), clientAlwaysFailCredErrorMsg) {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	tc := testgrpc.NewTestServiceClient(cc)
+	if _, err = tc.EmptyCall(ctx, &testpb.Empty{}); strings.Contains(err.Error(), clientAlwaysFailCredErrorMsg) {
+		return
 	}
 	te.t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want err.Error() contains %q", err, clientAlwaysFailCredErrorMsg)
 }
@@ -259,21 +255,28 @@ func (s) TestWaitForReadyRPCErrorOnBadCertificates(t *testing.T) {
 	defer te.tearDown()
 
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(clientAlwaysFailCred{})}
-	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer dcancel()
-	cc, err := grpc.DialContext(dctx, te.srvAddr, opts...)
+	cc, err := grpc.NewClient(te.srvAddr, opts...)
 	if err != nil {
-		t.Fatalf("Dial(_) = %v, want %v", err, nil)
+		t.Fatalf("NewClient(_) = %v, want %v", err, nil)
 	}
 	defer cc.Close()
 
-	tc := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// The DNS resolver may take more than defaultTestShortTimeout, we let the
+	// channel enter TransientFailure signalling that the first resolver state
+	// has been produced.
+	cc.Connect()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err = tc.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); strings.Contains(err.Error(), clientAlwaysFailCredErrorMsg) {
-		return
+	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+
+	tc := testgrpc.NewTestServiceClient(cc)
+	// Use a short context as WaitForReady waits for context expiration before
+	// failing the RPC.
+	ctx, cancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer cancel()
+	if _, err = tc.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); !strings.Contains(err.Error(), clientAlwaysFailCredErrorMsg) {
+		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want err.Error() contains %q", err, clientAlwaysFailCredErrorMsg)
 	}
-	te.t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want err.Error() contains %q", err, clientAlwaysFailCredErrorMsg)
 }
 
 var (
@@ -284,17 +287,24 @@ var (
 	}
 )
 
-type testPerRPCCredentials struct{}
+type testPerRPCCredentials struct {
+	authdata map[string]string
+	errChan  chan error
+}
 
-func (cr testPerRPCCredentials) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return authdata, nil
+func (cr testPerRPCCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	var err error
+	if cr.errChan != nil {
+		err = <-cr.errChan
+	}
+	return cr.authdata, err
 }
 
 func (cr testPerRPCCredentials) RequireTransportSecurity() bool {
 	return false
 }
 
-func authHandle(ctx context.Context, info *tap.Info) (context.Context, error) {
+func authHandle(ctx context.Context, _ *tap.Info) (context.Context, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ctx, fmt.Errorf("didn't find metadata in context")
@@ -320,12 +330,12 @@ func (s) TestPerRPCCredentialsViaDialOptions(t *testing.T) {
 func testPerRPCCredentialsViaDialOptions(t *testing.T, e env) {
 	te := newTest(t, e)
 	te.tapHandle = authHandle
-	te.perRPCCreds = testPerRPCCredentials{}
+	te.perRPCCreds = testPerRPCCredentials{authdata: authdata}
 	te.startServer(&testServer{security: e.security})
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
@@ -346,10 +356,10 @@ func testPerRPCCredentialsViaCallOptions(t *testing.T, e env) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.PerRPCCredentials(testPerRPCCredentials{})); err != nil {
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.PerRPCCredentials(testPerRPCCredentials{authdata: authdata})); err != nil {
 		t.Fatalf("Test failed. Reason: %v", err)
 	}
 }
@@ -362,7 +372,7 @@ func (s) TestPerRPCCredentialsViaDialOptionsAndCallOptions(t *testing.T) {
 
 func testPerRPCCredentialsViaDialOptionsAndCallOptions(t *testing.T, e env) {
 	te := newTest(t, e)
-	te.perRPCCreds = testPerRPCCredentials{}
+	te.perRPCCreds = testPerRPCCredentials{authdata: authdata}
 	// When credentials are provided via both dial options and call options,
 	// we apply both sets.
 	te.tapHandle = func(ctx context.Context, _ *tap.Info) (context.Context, error) {
@@ -388,10 +398,10 @@ func testPerRPCCredentialsViaDialOptionsAndCallOptions(t *testing.T, e env) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	tc := testpb.NewTestServiceClient(cc)
+	tc := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.PerRPCCredentials(testPerRPCCredentials{})); err != nil {
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.PerRPCCredentials(testPerRPCCredentials{authdata: authdata})); err != nil {
 		t.Fatalf("Test failed. Reason: %v", err)
 	}
 }
@@ -403,7 +413,7 @@ type authorityCheckCreds struct {
 	got string
 }
 
-func (c *authorityCheckCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c *authorityCheckCreds) ClientHandshake(_ context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	c.got = authority
 	return rawConn, nil, nil
 }
@@ -428,24 +438,17 @@ func (s) TestCredsHandshakeAuthority(t *testing.T) {
 
 	r := manual.NewBuilderWithScheme("whatever")
 
-	cc, err := grpc.Dial(r.Scheme()+":///"+testAuthority, grpc.WithTransportCredentials(cred), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///"+testAuthority, grpc.WithTransportCredentials(cred), grpc.WithResolvers(r))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%q) = %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%q) = %v", lis.Addr().String(), err)
 	}
 	defer cc.Close()
+	cc.Connect()
 	r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: lis.Addr().String()}}})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	for {
-		s := cc.GetState()
-		if s == connectivity.Ready {
-			break
-		}
-		if !cc.WaitForStateChange(ctx, s) {
-			t.Fatalf("ClientConn is not ready after 100 ms")
-		}
-	}
+	testutils.AwaitState(ctx, t, cc, connectivity.Ready)
 
 	if cred.got != testAuthority {
 		t.Fatalf("client creds got authority: %q, want: %q", cred.got, testAuthority)
@@ -468,24 +471,17 @@ func (s) TestCredsHandshakeServerNameAuthority(t *testing.T) {
 
 	r := manual.NewBuilderWithScheme("whatever")
 
-	cc, err := grpc.Dial(r.Scheme()+":///"+testAuthority, grpc.WithTransportCredentials(cred), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///"+testAuthority, grpc.WithTransportCredentials(cred), grpc.WithResolvers(r))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%q) = %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%q) = %v", lis.Addr().String(), err)
 	}
 	defer cc.Close()
+	cc.Connect()
 	r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: lis.Addr().String(), ServerName: testServerName}}})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	for {
-		s := cc.GetState()
-		if s == connectivity.Ready {
-			break
-		}
-		if !cc.WaitForStateChange(ctx, s) {
-			t.Fatalf("ClientConn is not ready after 100 ms")
-		}
-	}
+	testutils.AwaitState(ctx, t, cc, connectivity.Ready)
 
 	if cred.got != testServerName {
 		t.Fatalf("client creds got authority: %q, want: %q", cred.got, testAuthority)
@@ -496,7 +492,7 @@ type serverDispatchCred struct {
 	rawConnCh chan net.Conn
 }
 
-func (c *serverDispatchCred) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c *serverDispatchCred) ClientHandshake(_ context.Context, _ string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	return rawConn, nil, nil
 }
 func (c *serverDispatchCred) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
@@ -512,7 +508,7 @@ func (c *serverDispatchCred) Info() credentials.ProtocolInfo {
 func (c *serverDispatchCred) Clone() credentials.TransportCredentials {
 	return nil
 }
-func (c *serverDispatchCred) OverrideServerName(s string) error {
+func (c *serverDispatchCred) OverrideServerName(string) error {
 	return nil
 }
 func (c *serverDispatchCred) getRawConn() net.Conn {
@@ -531,11 +527,12 @@ func (s) TestServerCredsDispatch(t *testing.T) {
 	go s.Serve(lis)
 	defer s.Stop()
 
-	cc, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(cred))
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(cred))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%q) = %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%q) = %v", lis.Addr().String(), err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	rawConn := cred.getRawConn()
 	// Give grpc a chance to see the error and potentially close the connection.

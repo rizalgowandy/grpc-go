@@ -25,8 +25,8 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -57,7 +57,7 @@ func main() {
 
 	ca := x509.NewCertPool()
 	caFilePath := data.Path("x509/ca_cert.pem")
-	caBytes, err := ioutil.ReadFile(caFilePath)
+	caBytes, err := os.ReadFile(caFilePath)
 	if err != nil {
 		log.Fatalf("failed to read ca cert %q: %v", caFilePath, err)
 	}
@@ -71,7 +71,7 @@ func main() {
 		RootCAs:      ca,
 	}
 
-	conn, err := grpc.Dial(*addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 	}
